@@ -1,6 +1,11 @@
 use clap::{Parser, Subcommand};
 
+mod agents;
 mod config;
+mod providers;
+
+use agents::{Agent, AgentInput, CoderAgent};
+use providers::NoopProvider;
 
 #[derive(Parser)]
 #[command(name = "parser")]
@@ -29,12 +34,13 @@ enum Commands {
     External(Vec<String>),
 }
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
-        Commands::Init => config::init(),
-        Commands::Run { task } => run_task(&task.join(" ")),
-        Commands::External(words) => run_task(&words.join(" ")),
+    let result: Result<(), Box<dyn std::error::Error>> = match cli.command {
+        Commands::Init => config::init().map_err(Into::into),
+        Commands::Run { task } => run_task(&task.join(" ")).await,
+        Commands::External(words) => run_task(&words.join(" ")).await,
     };
     if let Err(e) = result {
         eprintln!("error: {}", e);
@@ -42,11 +48,20 @@ fn main() {
     }
 }
 
-fn run_task(_task: &str) -> Result<(), config::ConfigError> {
+async fn run_task(task: &str) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::Config::load()?;
     println!("Config loaded successfully");
     println!("Model: {}", cfg.model.name);
     println!("Endpoint: {}", cfg.model.endpoint);
-    println!("Ready. Provider and agent coming in next step.");
+
+    let agent = CoderAgent::new();
+    let provider = NoopProvider;
+    let input = AgentInput {
+        task: task.to_string(),
+        conversation_history: Vec::new(),
+    };
+    let output = agent.run(input, &provider).await?;
+    println!("{}", output.response);
+
     Ok(())
 }
