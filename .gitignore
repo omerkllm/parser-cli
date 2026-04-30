@@ -1,0 +1,15 @@
+# Build output — large, regenerated on `cargo build`
+target/
+
+# Per-machine linker config (contains absolute path with username)
+.cargo/config.toml
+
+# Secrets — never commit
+.env
+*.env
+
+# Local Parser state — indices, decision logs, per-project data
+.parser/
+
+# Per-developer config — may hold endpoint / model / api_key_env choices
+parser.config.toml
