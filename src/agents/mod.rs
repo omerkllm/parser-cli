@@ -2,11 +2,14 @@
 
 use crate::providers::{Message, ModelProvider, ProviderError};
 
+const MAX_TASK_LEN: usize = 32_768;
+
 pub struct AgentInput {
     pub task: String,
     pub conversation_history: Vec<Message>,
 }
 
+#[derive(Debug)]
 pub struct AgentOutput {
     pub response: String,
 }
@@ -39,6 +42,10 @@ pub enum AgentError {
     /// The task string was empty after trimming. Surfaced before any
     /// provider call so an empty prompt never leaves the binary.
     TaskEmpty,
+    /// The task string (after trimming) exceeded the agent's
+    /// length budget. Carries the actual length and the configured
+    /// maximum so the user knows by how much they need to shorten.
+    TaskTooLong { length: usize, max: usize },
 }
 
 impl std::fmt::Display for AgentError {
@@ -50,6 +57,9 @@ impl std::fmt::Display for AgentError {
             }
             AgentError::ContextLimitExceeded => f.write_str("context limit exceeded"),
             AgentError::TaskEmpty => f.write_str("task cannot be empty"),
+            AgentError::TaskTooLong { length, max } => {
+                write!(f, "task is {} characters, maximum is {}", length, max)
+            }
         }
     }
 }
@@ -118,11 +128,73 @@ impl Agent for CoderAgent {
         input: AgentInput,
         _provider: &dyn ModelProvider,
     ) -> Result<AgentOutput, AgentError> {
-        if input.task.trim().is_empty() {
+        let trimmed = input.task.trim();
+        if trimmed.is_empty() {
             return Err(AgentError::TaskEmpty);
+        }
+        if trimmed.len() > MAX_TASK_LEN {
+            return Err(AgentError::TaskTooLong {
+                length: trimmed.len(),
+                max: MAX_TASK_LEN,
+            });
         }
         Ok(AgentOutput {
             response: "Coder agent placeholder".to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::NoopProvider;
+
+    /// Proves that a task containing only whitespace is treated
+    /// as empty after `.trim()` and surfaces as
+    /// `AgentError::TaskEmpty`. Without trimming first, a string
+    /// like "    " would slip past the empty check and reach the
+    /// provider — which is exactly what the validation prevents.
+    #[tokio::test]
+    async fn whitespace_only_task_returns_task_empty() {
+        let agent = CoderAgent::new();
+        let provider = NoopProvider;
+        let input = AgentInput {
+            task: "   \t \n  ".to_string(),
+            conversation_history: Vec::new(),
+        };
+
+        let err = agent.run(input, &provider).await.unwrap_err();
+
+        assert!(
+            matches!(err, AgentError::TaskEmpty),
+            "expected TaskEmpty, got: {:?}",
+            err
+        );
+    }
+
+    /// Proves that a task longer than `MAX_TASK_LEN` characters
+    /// (after trimming) is rejected with
+    /// `AgentError::TaskTooLong`, carrying both the actual length
+    /// and the configured maximum so the error message shows the
+    /// user exactly how much they need to trim.
+    #[tokio::test]
+    async fn task_longer_than_max_returns_task_too_long() {
+        let agent = CoderAgent::new();
+        let provider = NoopProvider;
+        let big_task = "x".repeat(MAX_TASK_LEN + 1);
+        let input = AgentInput {
+            task: big_task,
+            conversation_history: Vec::new(),
+        };
+
+        let err = agent.run(input, &provider).await.unwrap_err();
+
+        match err {
+            AgentError::TaskTooLong { length, max } => {
+                assert_eq!(length, MAX_TASK_LEN + 1);
+                assert_eq!(max, MAX_TASK_LEN);
+            }
+            other => panic!("expected TaskTooLong, got: {:?}", other),
+        }
     }
 }

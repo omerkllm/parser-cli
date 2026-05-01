@@ -124,17 +124,19 @@ pub enum AgentError {
     InvalidResponse(String),
     ContextLimitExceeded,
     TaskEmpty,
+    TaskTooLong { length: usize, max: usize },
 }
 ```
 
-The four failure modes an agent run can surface:
+The five failure modes an agent run can surface:
 
 | Variant | When it fires |
 |---|---|
 | `ProviderFailed(ProviderError)` | The underlying [`ModelProvider`](providers.md#the-modelprovider-trait) returned an error during completion — network failure, non-2xx response, auth rejection, malformed stream. The original [`ProviderError`](providers.md#providererror) is wrapped, not flattened, so the network/API/auth/stream context isn't lost. |
 | `InvalidResponse(String)` | The completion succeeded at the transport level but produced a body the agent couldn't use: malformed JSON in a structured-output mode, an empty body where content was required, a tool-call payload that didn't match the schema. The string describes what was wrong. |
 | `ContextLimitExceeded` | The conversation history plus the new task would exceed the configured model's context window. The agent declined to send a request guaranteed to be truncated, leaving the caller to drop history or shorten the task. Carries no payload — the recovery is the same in every case. |
-| `TaskEmpty` | The task string was empty after trimming. Surfaced before any provider call, so an empty prompt never leaves the binary. Currently the only variant `CoderAgent::run` actually constructs (the placeholder body validates this and returns the literal string for everything else). |
+| `TaskEmpty` | The task string was empty after trimming. Surfaced before any provider call, so an empty prompt never leaves the binary. The check is `input.task.trim().is_empty()`, so `"   \t  "` (only whitespace) fails the same as `""`. |
+| `TaskTooLong { length, max }` | The task string (after trimming) exceeded `MAX_TASK_LEN` (currently 32,768 characters). Carries the actual `length` and the configured `max` so the error message tells the user exactly how much they need to trim. |
 
 `Display` writes them as:
 
@@ -144,6 +146,7 @@ The four failure modes an agent run can surface:
 | `InvalidResponse(s)` | `"agent received invalid response: {s}"` |
 | `ContextLimitExceeded` | `"context limit exceeded"` |
 | `TaskEmpty` | `"task cannot be empty"` |
+| `TaskTooLong { length, max }` | `"task is {length} characters, maximum is {max}"` |
 
 `impl std::error::Error for AgentError {}` lets the type widen
 into `Box<dyn Error>` at [main.rs](src/main.rs) where it joins
@@ -190,8 +193,15 @@ impl Agent for CoderAgent {
         input: AgentInput,
         _provider: &dyn ModelProvider,
     ) -> Result<AgentOutput, AgentError> {
-        if input.task.trim().is_empty() {
+        let trimmed = input.task.trim();
+        if trimmed.is_empty() {
             return Err(AgentError::TaskEmpty);
+        }
+        if trimmed.len() > MAX_TASK_LEN {
+            return Err(AgentError::TaskTooLong {
+                length: trimmed.len(),
+                max: MAX_TASK_LEN,
+            });
         }
         Ok(AgentOutput {
             response: "Coder agent placeholder".to_string(),
@@ -200,13 +210,39 @@ impl Agent for CoderAgent {
 }
 ```
 
-The body has one piece of real logic — an empty-task guard that
-short-circuits with [`AgentError::TaskEmpty`](#agenterror) before
-any provider call. Everything else is still placeholder: the
-`_provider` underscore-prefix suppresses the unused-argument
-warning until the real body wires it in, and the success path
-returns the literal `"Coder agent placeholder"` regardless of
-what `input.task` contains.
+The body has two pieces of real logic, both input validation:
+
+1. **Empty-task guard.** `input.task.trim()` strips leading and
+   trailing whitespace; if the remainder is empty the run
+   short-circuits with [`AgentError::TaskEmpty`](#agenterror).
+   This means `"    "` fails the same as `""` — the check looks
+   at semantic content, not raw character count.
+2. **Length cap.** If the trimmed task exceeds `MAX_TASK_LEN`
+   (32,768 characters), the run short-circuits with
+   [`AgentError::TaskTooLong`](#agenterror) carrying the actual
+   length and the max. Catches pathological inputs (a multi-MB
+   prompt accidentally piped in) before they ever reach the
+   provider's request body.
+
+Everything else is still placeholder: the `_provider`
+underscore-prefix suppresses the unused-argument warning until
+the real body wires it in, and the success path returns the
+literal `"Coder agent placeholder"` regardless of what
+`input.task` contains.
+
+## Tests
+
+Two unit tests in `#[cfg(test)] mod tests`, both using
+`#[tokio::test]` so they can `.await` `CoderAgent::run`:
+
+| Test | Proves |
+|---|---|
+| `whitespace_only_task_returns_task_empty` | A task of just spaces/tabs/newlines fails the same as `""`, returning `AgentError::TaskEmpty`. |
+| `task_longer_than_max_returns_task_too_long` | A task longer than `MAX_TASK_LEN` after trimming returns `AgentError::TaskTooLong { length, max }` carrying the actual lengths so the user sees how much to trim. |
+
+Both tests use `NoopProvider` for the `&dyn ModelProvider` slot;
+the validation runs before any provider call, so the noop never
+gets invoked.
 
 The unit-struct shape (`pub struct CoderAgent;` — no fields) is
 right for a stateless placeholder. Real `CoderAgent` will likely

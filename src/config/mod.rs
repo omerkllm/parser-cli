@@ -16,6 +16,15 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const DEFAULT_WORKSPACE_DATA_DIR: &str = ".parser";
 
+const MAX_MODEL_NAME_LEN: usize = 200;
+const MAX_API_KEY_ENV_LEN: usize = 200;
+const MIN_TEMPERATURE: f32 = 0.0;
+const MAX_TEMPERATURE: f32 = 2.0;
+const MIN_MAX_TOKENS: u32 = 1;
+const MAX_MAX_TOKENS: u32 = 32_768;
+const MIN_CONTEXT_LIMIT: u32 = 1;
+const MAX_CONTEXT_LIMIT: u32 = 2_000_000;
+
 // ---------- resolved config ----------
 
 #[derive(Debug, Clone)]
@@ -106,7 +115,9 @@ pub enum ConfigError {
     Read(PathBuf, io::Error),
     Parse(PathBuf, toml::de::Error),
     MissingField(&'static str),
+    InvalidField { field: &'static str, reason: String },
     InvalidUrl { value: String, reason: String },
+    InvalidApiKey { reason: String },
     EnvVarNotSet { var: String },
     HomeDirUnknown,
     Io(io::Error),
@@ -132,10 +143,20 @@ impl fmt::Display for ConfigError {
                 "required field `{}` is missing from parser.config.toml\n  add it under the matching section",
                 field
             ),
+            ConfigError::InvalidField { field, reason } => write!(
+                f,
+                "invalid value for `{}`: {}",
+                field, reason
+            ),
             ConfigError::InvalidUrl { value, reason } => write!(
                 f,
                 "endpoint `{}` is not a valid URL: {}\n  a valid endpoint looks like: https://openrouter.ai/api/v1",
                 value, reason
+            ),
+            ConfigError::InvalidApiKey { reason } => write!(
+                f,
+                "invalid API key: {}",
+                reason
             ),
             ConfigError::EnvVarNotSet { var } => write!(
                 f,
@@ -232,10 +253,19 @@ impl Config {
         let api_key_env = require(model_raw.api_key_env, "model.api_key_env")?;
 
         validate_endpoint(&endpoint)?;
+        let endpoint = endpoint.trim_end_matches('/').to_string();
+        let endpoint = match endpoint.strip_suffix("/chat/completions") {
+            Some(stripped) => stripped.to_string(),
+            None => endpoint,
+        };
+
+        validate_model_name(&name)?;
+        validate_api_key_env_name(&api_key_env)?;
 
         let api_key = env::var(&api_key_env).map_err(|_| ConfigError::EnvVarNotSet {
             var: api_key_env.clone(),
         })?;
+        validate_api_key_value(&api_key)?;
 
         let model = ModelConfig {
             endpoint,
@@ -249,6 +279,7 @@ impl Config {
             temperature: raw.parameters.temperature.unwrap_or(DEFAULT_TEMPERATURE),
             context_limit: raw.parameters.context_limit,
         };
+        validate_parameters(&parameters)?;
 
         let data_dir = match raw.paths.data_dir {
             Some(s) => expand_tilde(&s)?,
@@ -308,6 +339,107 @@ fn validate_endpoint(endpoint: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_model_name(name: &str) -> Result<(), ConfigError> {
+    if name.trim().is_empty() {
+        return Err(ConfigError::InvalidField {
+            field: "model.name",
+            reason: "must not be empty or contain only whitespace".to_string(),
+        });
+    }
+    if name.len() > MAX_MODEL_NAME_LEN {
+        return Err(ConfigError::InvalidField {
+            field: "model.name",
+            reason: format!(
+                "name is {} characters, maximum is {}",
+                name.len(),
+                MAX_MODEL_NAME_LEN
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_api_key_env_name(name: &str) -> Result<(), ConfigError> {
+    if name.chars().any(char::is_whitespace) {
+        return Err(ConfigError::InvalidField {
+            field: "model.api_key_env",
+            reason: "must not contain whitespace".to_string(),
+        });
+    }
+    if name.len() > MAX_API_KEY_ENV_LEN {
+        return Err(ConfigError::InvalidField {
+            field: "model.api_key_env",
+            reason: format!(
+                "name is {} characters, maximum is {}",
+                name.len(),
+                MAX_API_KEY_ENV_LEN
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_api_key_value(api_key: &str) -> Result<(), ConfigError> {
+    let trimmed = api_key.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::InvalidApiKey {
+            reason: "value is empty after trimming whitespace".to_string(),
+        });
+    }
+    if api_key.contains('\n') || api_key.contains('\r') {
+        return Err(ConfigError::InvalidApiKey {
+            reason: "value contains a newline or carriage return — common copy-paste mistake; re-export the variable on a single line".to_string(),
+        });
+    }
+    if trimmed.starts_with('"') || trimmed.ends_with('"') {
+        return Err(ConfigError::InvalidApiKey {
+            reason:
+                "value contains surrounding quotes — set the key without quotes: export KEY=value"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_parameters(p: &ParametersConfig) -> Result<(), ConfigError> {
+    if !(MIN_TEMPERATURE..=MAX_TEMPERATURE).contains(&p.temperature) {
+        return Err(ConfigError::InvalidField {
+            field: "parameters.temperature",
+            reason: format!(
+                "{} is outside the allowed range {}..={}",
+                p.temperature, MIN_TEMPERATURE, MAX_TEMPERATURE
+            ),
+        });
+    }
+    if !(MIN_MAX_TOKENS..=MAX_MAX_TOKENS).contains(&p.max_tokens) {
+        return Err(ConfigError::InvalidField {
+            field: "parameters.max_tokens",
+            reason: format!(
+                "{} is outside the allowed range {}..={}",
+                p.max_tokens, MIN_MAX_TOKENS, MAX_MAX_TOKENS
+            ),
+        });
+    }
+    if let Some(cl) = p.context_limit {
+        if !(MIN_CONTEXT_LIMIT..=MAX_CONTEXT_LIMIT).contains(&cl) {
+            return Err(ConfigError::InvalidField {
+                field: "parameters.context_limit",
+                reason: format!(
+                    "{} is outside the allowed range {}..={}",
+                    cl, MIN_CONTEXT_LIMIT, MAX_CONTEXT_LIMIT
+                ),
+            });
+        }
+        if cl <= p.max_tokens {
+            return Err(ConfigError::InvalidField {
+                field: "parameters.context_limit",
+                reason: format!("must be greater than max_tokens ({})", p.max_tokens),
+            });
+        }
+    }
+    Ok(())
+}
+
 // ---------- init command ----------
 
 pub fn init() -> Result<(), ConfigError> {
@@ -334,13 +466,41 @@ pub fn init() -> Result<(), ConfigError> {
 
     fs::create_dir_all(&dir).map_err(|e| ConfigError::Write(dir.clone(), e))?;
     let body = render_minimal_config(&endpoint, &model_name, &api_key_env);
-    fs::write(&path, body).map_err(|e| ConfigError::Write(path.clone(), e))?;
+    write_config_atomically(&path, &body)?;
 
     println!();
     println!("wrote config to {}", path.display());
     println!();
     println!("next: set the API key environment variable so parser can read it");
     println!("  export {}=\"your-api-key-here\"", api_key_env);
+    Ok(())
+}
+
+/// Write the config body atomically: write to `<path>.tmp` first,
+/// then rename onto `path`. If the write fails partway through,
+/// the partial `.tmp` file is removed before returning, so a
+/// killed-mid-write process can never leave behind a corrupt
+/// `parser.config.toml`. The rename is atomic on every supported
+/// filesystem; the user will see either the old config or the
+/// new one, never a half-written intermediate.
+fn write_config_atomically(path: &Path, body: &str) -> Result<(), ConfigError> {
+    let mut tmp_name = path
+        .file_name()
+        .expect("config file path has a file name")
+        .to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+
+    if let Err(e) = fs::write(&tmp_path, body) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ConfigError::Write(tmp_path, e));
+    }
+
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ConfigError::Write(path.to_path_buf(), e));
+    }
+
     Ok(())
 }
 
@@ -421,6 +581,330 @@ mod tests {
         assert_eq!(cfg.model.api_key_env, "PARSER_TEST_KEY_INVARIANT_1");
         assert_eq!(cfg.model.api_key, "sk-or-v1-FAKE-abc123");
         assert_ne!(cfg.model.api_key, cfg.model.api_key_env);
+    }
+
+    /// Proves that a trailing `/` on the configured endpoint is
+    /// stripped silently after URL validation, so consumers of
+    /// `cfg.model.endpoint` can append paths like `/chat/completions`
+    /// without producing double slashes on the wire.
+    #[test]
+    fn endpoint_trailing_slash_is_stripped_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+            [model]
+            endpoint = "https://openrouter.ai/api/v1/"
+            name = "x"
+            api_key_env = "PARSER_TEST_KEY_INVARIANT_3"
+            "#,
+        );
+        std::env::set_var("PARSER_TEST_KEY_INVARIANT_3", "k");
+
+        let cfg = Config::load_from(&path).expect("load");
+
+        assert_eq!(cfg.model.endpoint, "https://openrouter.ai/api/v1");
+    }
+
+    /// Proves that a `model.name` longer than `MAX_MODEL_NAME_LEN`
+    /// characters is rejected with `ConfigError::InvalidField`,
+    /// targeting the right field. Guards against pathological
+    /// input — a 10 MB string accidentally pasted in — reaching
+    /// the provider request body.
+    #[test]
+    fn model_name_longer_than_max_returns_invalid_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long_name = "x".repeat(MAX_MODEL_NAME_LEN + 1);
+        let body = format!(
+            r#"
+            [model]
+            endpoint = "https://openrouter.ai/api/v1"
+            name = "{}"
+            api_key_env = "PARSER_TEST_KEY_INVARIANT_4"
+            "#,
+            long_name
+        );
+        let path = write_config(tmp.path(), &body);
+        std::env::set_var("PARSER_TEST_KEY_INVARIANT_4", "k");
+
+        let err = Config::load_from(&path).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::InvalidField { field, .. } if field == "model.name"),
+            "expected InvalidField for model.name, got: {:?}",
+            err
+        );
+    }
+
+    /// Proves that an `api_key_env` value containing whitespace is
+    /// rejected. Such names cannot be set via standard shell syntax
+    /// (`export FOO BAR=...` is a syntax error) — failing fast at
+    /// load time saves a confusing `EnvVarNotSet` error later.
+    #[test]
+    fn api_key_env_containing_whitespace_returns_invalid_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+            [model]
+            endpoint = "https://openrouter.ai/api/v1"
+            name = "x"
+            api_key_env = "PARSER TEST KEY"
+            "#,
+        );
+
+        let err = Config::load_from(&path).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::InvalidField { field, .. } if field == "model.api_key_env"),
+            "expected InvalidField for model.api_key_env, got: {:?}",
+            err
+        );
+    }
+
+    /// Proves that an `api_key_env` longer than
+    /// `MAX_API_KEY_ENV_LEN` is rejected with `InvalidField`.
+    #[test]
+    fn api_key_env_longer_than_max_returns_invalid_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long_name = "X".repeat(MAX_API_KEY_ENV_LEN + 1);
+        let body = format!(
+            r#"
+            [model]
+            endpoint = "https://openrouter.ai/api/v1"
+            name = "x"
+            api_key_env = "{}"
+            "#,
+            long_name
+        );
+        let path = write_config(tmp.path(), &body);
+
+        let err = Config::load_from(&path).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::InvalidField { field, .. } if field == "model.api_key_env"),
+            "expected InvalidField for model.api_key_env, got: {:?}",
+            err
+        );
+    }
+
+    /// Proves that a resolved API key consisting of only whitespace
+    /// is rejected with `InvalidApiKey`. Catches the common case of
+    /// the env var being set but empty — without this check the
+    /// provider would receive a blank `Authorization` header and
+    /// return a confusing 401.
+    #[test]
+    fn blank_api_key_returns_invalid_api_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+            [model]
+            endpoint = "https://openrouter.ai/api/v1"
+            name = "x"
+            api_key_env = "PARSER_TEST_KEY_INVARIANT_5"
+            "#,
+        );
+        std::env::set_var("PARSER_TEST_KEY_INVARIANT_5", "   \t  ");
+
+        let err = Config::load_from(&path).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::InvalidApiKey { .. }),
+            "expected InvalidApiKey, got: {:?}",
+            err
+        );
+    }
+
+    /// Proves that an API key containing a newline is rejected
+    /// with `InvalidApiKey`. Catches the most common copy-paste
+    /// mistake — accidentally including the trailing `\n` from
+    /// terminal output.
+    #[test]
+    fn api_key_with_newline_returns_invalid_api_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+            [model]
+            endpoint = "https://openrouter.ai/api/v1"
+            name = "x"
+            api_key_env = "PARSER_TEST_KEY_INVARIANT_6"
+            "#,
+        );
+        std::env::set_var(
+            "PARSER_TEST_KEY_INVARIANT_6",
+            "sk-or-v1-real-part\n-trailing",
+        );
+
+        let err = Config::load_from(&path).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::InvalidApiKey { .. }),
+            "expected InvalidApiKey, got: {:?}",
+            err
+        );
+    }
+
+    /// Proves that a `temperature` outside `MIN_TEMPERATURE..=MAX_TEMPERATURE`
+    /// is rejected with `InvalidField` targeting `parameters.temperature`.
+    #[test]
+    fn temperature_out_of_range_returns_invalid_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+            [model]
+            endpoint = "https://openrouter.ai/api/v1"
+            name = "x"
+            api_key_env = "PARSER_TEST_KEY_INVARIANT_7"
+
+            [parameters]
+            temperature = 3.0
+            "#,
+        );
+        std::env::set_var("PARSER_TEST_KEY_INVARIANT_7", "k");
+
+        let err = Config::load_from(&path).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::InvalidField { field, .. } if field == "parameters.temperature"),
+            "expected InvalidField for parameters.temperature, got: {:?}",
+            err
+        );
+    }
+
+    /// Proves that a `max_tokens` outside `MIN_MAX_TOKENS..=MAX_MAX_TOKENS`
+    /// is rejected with `InvalidField` targeting `parameters.max_tokens`.
+    #[test]
+    fn max_tokens_out_of_range_returns_invalid_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+            [model]
+            endpoint = "https://openrouter.ai/api/v1"
+            name = "x"
+            api_key_env = "PARSER_TEST_KEY_INVARIANT_8"
+
+            [parameters]
+            max_tokens = 0
+            "#,
+        );
+        std::env::set_var("PARSER_TEST_KEY_INVARIANT_8", "k");
+
+        let err = Config::load_from(&path).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::InvalidField { field, .. } if field == "parameters.max_tokens"),
+            "expected InvalidField for parameters.max_tokens, got: {:?}",
+            err
+        );
+    }
+
+    /// Proves that a `context_limit` outside
+    /// `MIN_CONTEXT_LIMIT..=MAX_CONTEXT_LIMIT` is rejected with
+    /// `InvalidField` targeting `parameters.context_limit`. The
+    /// validation runs only when `context_limit` is `Some`, so a
+    /// missing field still picks up the (no) default.
+    #[test]
+    fn context_limit_out_of_range_returns_invalid_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+            [model]
+            endpoint = "https://openrouter.ai/api/v1"
+            name = "x"
+            api_key_env = "PARSER_TEST_KEY_INVARIANT_9"
+
+            [parameters]
+            context_limit = 3000000
+            "#,
+        );
+        std::env::set_var("PARSER_TEST_KEY_INVARIANT_9", "k");
+
+        let err = Config::load_from(&path).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::InvalidField { field, .. } if field == "parameters.context_limit"),
+            "expected InvalidField for parameters.context_limit, got: {:?}",
+            err
+        );
+    }
+
+    /// Proves that an API key value with surrounding double-quote
+    /// characters is rejected with `InvalidApiKey`. Catches the
+    /// common Windows mistake of running `set KEY="value"` (or
+    /// `KEY="value"` in PowerShell) which stores the literal
+    /// quotes as part of the value.
+    #[test]
+    fn api_key_with_surrounding_quotes_returns_invalid_api_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+            [model]
+            endpoint = "https://openrouter.ai/api/v1"
+            name = "x"
+            api_key_env = "PARSER_TEST_KEY_INVARIANT_10"
+            "#,
+        );
+        std::env::set_var("PARSER_TEST_KEY_INVARIANT_10", "\"sk-or-v1-abc\"");
+
+        let err = Config::load_from(&path).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::InvalidApiKey { .. }),
+            "expected InvalidApiKey, got: {:?}",
+            err
+        );
+    }
+
+    /// Proves that `validate_model_name` rejects whitespace-only
+    /// names with `InvalidField` targeting `model.name`. Trimming
+    /// happens inside the helper, so `"   \t  "` is treated the
+    /// same as `""`.
+    #[test]
+    fn whitespace_only_model_name_is_rejected_by_validate() {
+        let result = validate_model_name("   \t  ");
+
+        assert!(
+            matches!(result, Err(ConfigError::InvalidField { field, .. }) if field == "model.name"),
+            "expected InvalidField for model.name, got: {:?}",
+            result
+        );
+    }
+
+    /// Proves that a `context_limit` smaller than or equal to
+    /// `max_tokens` is rejected with `InvalidField`. A context
+    /// window narrower than the output cap is logically invalid:
+    /// no room for the input would be left.
+    #[test]
+    fn context_limit_below_max_tokens_returns_invalid_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+            [model]
+            endpoint = "https://openrouter.ai/api/v1"
+            name = "x"
+            api_key_env = "PARSER_TEST_KEY_INVARIANT_11"
+
+            [parameters]
+            max_tokens = 4096
+            context_limit = 1000
+            "#,
+        );
+        std::env::set_var("PARSER_TEST_KEY_INVARIANT_11", "k");
+
+        let err = Config::load_from(&path).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::InvalidField { field, .. } if field == "parameters.context_limit"),
+            "expected InvalidField for parameters.context_limit, got: {:?}",
+            err
+        );
     }
 
     /// Proves that a `~/...` path in the config is expanded to an
