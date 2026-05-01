@@ -65,7 +65,7 @@ async fn main() {
 /// already trait-dispatched, so swapping the concrete type is
 /// the only edit needed at the call site.
 async fn run_task(task: &str) -> Result<(), Box<dyn std::error::Error>> {
-    config::Config::load()?;
+    let _cfg = config::Config::load()?;
 
     let agent = CoderAgent::new();
     let provider = NoopProvider;
