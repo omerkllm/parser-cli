@@ -109,17 +109,25 @@ impl std::error::Error for ProviderError {}
 /// works (OpenRouter, Ollama, Groq, Together AI, LM Studio, etc.).
 /// This trait is the single seam through which agents talk to
 /// models — a real provider only has to implement
-/// [`stream_completion`](ModelProvider::stream_completion).
+/// [`complete`](ModelProvider::complete).
 ///
 /// [`NoopProvider`] is the temporary compile stub used until the
 /// real OpenAI-compatible provider lands in the next step. Once
 /// that lands, `NoopProvider` is deleted and replaced.
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
-    /// Send a conversation to the model and stream the response
-    /// back chunk-by-chunk.
+    /// The required method. Send a conversation to the model and
+    /// return the full response as a `String`.
     ///
-    /// Streaming is the chosen interface for three reasons:
+    /// This is the only method an implementor *has* to write.
+    /// Convenient for tests, batch jobs, and any caller that
+    /// doesn't care about incremental output.
+    async fn complete(&self, messages: Vec<Message>) -> Result<String, ProviderError>;
+
+    /// Stream the response back chunk-by-chunk.
+    ///
+    /// Streaming is the right interface for the interactive CLI
+    /// path because:
     ///
     /// 1. **Latency to first token.** The user sees output almost
     ///    immediately, rather than after a long pause while the
@@ -131,28 +139,33 @@ pub trait ModelProvider: Send + Sync {
     ///    decision log) can react to chunks as they arrive instead
     ///    of waiting for end-of-response.
     ///
-    /// A simpler `complete()` method that returns the full string
-    /// at once will be added later as a convenience for callers
-    /// (tests, batch jobs) that don't care about streaming.
+    /// The default implementation calls
+    /// [`complete`](ModelProvider::complete) and yields the full
+    /// response as a single-item stream — correct behaviour, but
+    /// none of the latency or cancellation benefits above. Real
+    /// streaming providers (the OpenAI-compatible HTTP impl
+    /// landing in the next step) override this to parse SSE
+    /// chunks as they arrive and yield each delta as soon as it's
+    /// decoded.
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
-    ) -> Result<Pin<Box<dyn Stream<Item = String> + Send>>, ProviderError>;
+    ) -> Result<Pin<Box<dyn Stream<Item = String> + Send>>, ProviderError> {
+        let response = self.complete(messages).await?;
+        Ok(Box::pin(futures::stream::once(async move { response })))
+    }
 }
 
 /// Temporary compile stub. Exists only to satisfy the type system
 /// while no real provider is implemented — `main` needs *some*
 /// `ModelProvider` value to pass to `agent.run()`. Returns an
-/// empty stream from every call. Deleted in the next step when
+/// empty string from every call. Deleted in the next step when
 /// the real OpenAI-compatible provider lands.
 pub struct NoopProvider;
 
 #[async_trait]
 impl ModelProvider for NoopProvider {
-    async fn stream_completion(
-        &self,
-        _messages: Vec<Message>,
-    ) -> Result<Pin<Box<dyn Stream<Item = String> + Send>>, ProviderError> {
-        Ok(Box::pin(futures::stream::empty()))
+    async fn complete(&self, _messages: Vec<Message>) -> Result<String, ProviderError> {
+        Ok(String::new())
     }
 }

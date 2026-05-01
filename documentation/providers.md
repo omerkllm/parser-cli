@@ -170,19 +170,56 @@ the type widens cleanly into `Box<dyn Error>` in
 
 ## The `ModelProvider` trait
 
-[src/providers/mod.rs:32](src/providers/mod.rs:32):
+[src/providers/mod.rs:117](src/providers/mod.rs:117):
 
 ```rust
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
+    /// The required method.
+    async fn complete(
+        &self,
+        messages: Vec<Message>,
+    ) -> Result<String, ProviderError>;
+
+    /// Optional override. Default impl wraps complete().
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
-    ) -> Result<Pin<Box<dyn Stream<Item = String> + Send>>, ProviderError>;
+    ) -> Result<Pin<Box<dyn Stream<Item = String> + Send>>, ProviderError> {
+        let response = self.complete(messages).await?;
+        Ok(Box::pin(futures::stream::once(async move { response })))
+    }
 }
 ```
 
-Four pieces are doing real work:
+### `complete` vs `stream_completion`
+
+The trait exposes two methods that return the same conceptual
+result — the model's reply to a conversation — at different
+granularities:
+
+| Method | Returns | When to call | When to override |
+|---|---|---|---|
+| `complete` | `Result<String, ProviderError>` — the full response in one piece. | Tests, batch jobs, anywhere the caller wants the whole answer in one chunk and doesn't care about latency-to-first-token. | **Always.** This is the single required method. Every implementor must write a real `complete`. |
+| `stream_completion` | `Result<Pin<Box<dyn Stream<Item = String> + Send>>, ProviderError>` — chunks yielded as they arrive. | The interactive CLI path, where users want to see tokens land as soon as they're decoded. | Only when the underlying transport supports streaming (OpenAI-style SSE chunks). The default implementation calls `complete` and yields the whole response as a single-item stream — semantically correct, but with none of streaming's latency or cancellation benefits. |
+
+The split lets a minimal provider (a fixture, a mock, a non-streaming
+backend) implement only `complete` and inherit a working
+`stream_completion` for free, while a real OpenAI-compatible HTTP
+provider overrides `stream_completion` to parse SSE deltas.
+
+The default implementation is exactly:
+
+```rust
+let response = self.complete(messages).await?;
+Ok(Box::pin(futures::stream::once(async move { response })))
+```
+
+`futures::stream::once` builds a `Stream` that yields a single
+`Item` and then ends. `Box::pin` matches the trait's return
+signature.
+
+Four pieces are doing real work in the trait declaration itself:
 
 ### `#[async_trait]`
 
@@ -262,34 +299,40 @@ the CLI for live token display.
 
 ## `NoopProvider` — the stub
 
-[src/providers/mod.rs:40](src/providers/mod.rs:40):
+[src/providers/mod.rs:148](src/providers/mod.rs:148):
 
 ```rust
 pub struct NoopProvider;
 
 #[async_trait]
 impl ModelProvider for NoopProvider {
-    async fn stream_completion(
+    async fn complete(
         &self,
         _messages: Vec<Message>,
-    ) -> Result<Pin<Box<dyn Stream<Item = String> + Send>>, ProviderError> {
-        Ok(Box::pin(futures::stream::empty()))
+    ) -> Result<String, ProviderError> {
+        Ok(String::new())
     }
 }
 ```
 
-A throwaway implementation that returns an empty stream. It exists
-for one reason: the trait shape ships now (Step 2), but the real
-HTTP-talking implementation ships in Step 3. Without `NoopProvider`,
-[main.rs:58](src/main.rs:58) couldn't fill the
-`&dyn ModelProvider` slot when calling `agent.run(...)` — the binary
-wouldn't compile.
+A throwaway implementation that returns an empty string from
+`complete`. It exists for one reason: the trait shape ships now,
+but the real HTTP-talking implementation lands in the next step.
+Without `NoopProvider`, [main.rs](src/main.rs) couldn't fill the
+`&dyn ModelProvider` slot when calling `agent.run(...)` — the
+binary wouldn't compile.
 
-`futures::stream::empty()` produces a `Stream` that immediately
-yields `None`. `Box::pin` heap-allocates it and pins the box, making
-the type match the trait's return signature.
+`NoopProvider` only implements `complete`. Calls to
+`stream_completion` go through the trait's default implementation,
+which awaits `complete` (`Ok(String::new())`) and wraps the empty
+string in `futures::stream::once`. The resulting stream yields a
+single empty string and then ends. That's a slight behaviour
+change from the previous `futures::stream::empty()` version (which
+yielded zero items) but matches the intent: "the provider has
+nothing to say, but it didn't fail."
 
-Step 3 deletes both the `NoopProvider` struct and its `impl` block.
+The next step deletes both the `NoopProvider` struct and its
+`impl` block.
 
 ## What this module deliberately doesn't do (yet)
 
