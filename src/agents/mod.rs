@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::providers::{Message, ModelProvider};
+use crate::providers::{Message, ModelProvider, ProviderError};
 
 pub struct AgentInput {
     pub task: String,
@@ -13,23 +13,54 @@ pub struct AgentOutput {
 
 /// Error type returned by [`Agent::run`].
 ///
-/// Empty by design: a placeholder agent cannot fail, so there are
-/// no variants yet. Real failure modes — provider errors, parse
-/// failures, tool-call errors — get added as variants when the
-/// real `CoderAgent::run` body lands in the next step. Keeping the
-/// type in place now means the trait signature is stable; adding
-/// variants later is a non-breaking change for callers that
-/// already match exhaustively against `Result<_, AgentError>`.
+/// Each variant covers a distinct failure mode an agent run can
+/// hit. `AgentError` widens cleanly into `Box<dyn std::error::Error>`
+/// in [`crate::main`](crate)'s top-level handler, so callers don't
+/// need bespoke conversion code.
 #[derive(Debug)]
-pub enum AgentError {}
+pub enum AgentError {
+    /// The provider returned an error during completion. Wraps the
+    /// underlying [`ProviderError`] so the original network / API /
+    /// auth / stream context isn't lost. `From<ProviderError>` is
+    /// implemented for this variant, so `?` on a provider call
+    /// inside `run` propagates the failure with no manual `map_err`.
+    ProviderFailed(ProviderError),
+    /// The model returned a response that the agent could not use:
+    /// malformed JSON in a structured-output mode, an empty body
+    /// where content was required, a schema mismatch on a tool call,
+    /// etc. The inner string describes what was wrong.
+    InvalidResponse(String),
+    /// The conversation history plus the new task exceeded the
+    /// context-window budget for the configured model. The agent
+    /// declined to send a request that was guaranteed to be
+    /// truncated. Carries no payload — the recovery is the same in
+    /// every case: drop history or shorten the task.
+    ContextLimitExceeded,
+    /// The task string was empty after trimming. Surfaced before any
+    /// provider call so an empty prompt never leaves the binary.
+    TaskEmpty,
+}
 
 impl std::fmt::Display for AgentError {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {}
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentError::ProviderFailed(e) => write!(f, "provider error: {}", e),
+            AgentError::InvalidResponse(s) => {
+                write!(f, "agent received invalid response: {}", s)
+            }
+            AgentError::ContextLimitExceeded => f.write_str("context limit exceeded"),
+            AgentError::TaskEmpty => f.write_str("task cannot be empty"),
+        }
     }
 }
 
 impl std::error::Error for AgentError {}
+
+impl From<ProviderError> for AgentError {
+    fn from(e: ProviderError) -> Self {
+        AgentError::ProviderFailed(e)
+    }
+}
 
 /// The shared interface for all five planned agents.
 ///
@@ -61,11 +92,12 @@ pub trait Agent {
     ) -> Result<AgentOutput, AgentError>;
 }
 
-/// Placeholder Coder agent. Returns the literal string
-/// `"Coder agent placeholder"` from `run` and ignores both
-/// arguments — the underscore prefixes on `_input` and `_provider`
-/// are intentional, suppressing "unused argument" warnings until
-/// the real body wires them up.
+/// Placeholder Coder agent. Validates that `input.task` is not
+/// empty (returning [`AgentError::TaskEmpty`] otherwise) and then
+/// returns the literal string `"Coder agent placeholder"`. The
+/// `_provider` argument is still ignored — the underscore prefix
+/// suppresses "unused argument" warnings until the real body
+/// wires it up.
 ///
 /// The real implementation lands in the next step: build a system
 /// prompt, append `input.conversation_history` and the new task
@@ -83,9 +115,12 @@ impl CoderAgent {
 impl Agent for CoderAgent {
     async fn run(
         &self,
-        _input: AgentInput,
+        input: AgentInput,
         _provider: &dyn ModelProvider,
     ) -> Result<AgentOutput, AgentError> {
+        if input.task.trim().is_empty() {
+            return Err(AgentError::TaskEmpty);
+        }
         Ok(AgentOutput {
             response: "Coder agent placeholder".to_string(),
         })

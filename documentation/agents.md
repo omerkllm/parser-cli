@@ -117,34 +117,59 @@ placeholder doesn't pretend to know what real output looks like.
 
 ## `AgentError`
 
-[src/agents/mod.rs:12](src/agents/mod.rs:12):
-
 ```rust
 #[derive(Debug)]
-pub enum AgentError {}
-
-impl std::fmt::Display for AgentError {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {}
-    }
+pub enum AgentError {
+    ProviderFailed(ProviderError),
+    InvalidResponse(String),
+    ContextLimitExceeded,
+    TaskEmpty,
 }
-
-impl std::error::Error for AgentError {}
 ```
 
-An **empty enum** — no variants, unconstructible. This honestly
-reflects the current state: a placeholder that always returns
-`Ok(...)` cannot fail, so its error type has no shapes.
+The four failure modes an agent run can surface:
 
-The `Display` impl is a `match *self {}`, exhaustive over zero
-variants. It compiles and trivially satisfies the trait.
+| Variant | When it fires |
+|---|---|
+| `ProviderFailed(ProviderError)` | The underlying [`ModelProvider`](providers.md#the-modelprovider-trait) returned an error during completion — network failure, non-2xx response, auth rejection, malformed stream. The original [`ProviderError`](providers.md#providererror) is wrapped, not flattened, so the network/API/auth/stream context isn't lost. |
+| `InvalidResponse(String)` | The completion succeeded at the transport level but produced a body the agent couldn't use: malformed JSON in a structured-output mode, an empty body where content was required, a tool-call payload that didn't match the schema. The string describes what was wrong. |
+| `ContextLimitExceeded` | The conversation history plus the new task would exceed the configured model's context window. The agent declined to send a request guaranteed to be truncated, leaving the caller to drop history or shorten the task. Carries no payload — the recovery is the same in every case. |
+| `TaskEmpty` | The task string was empty after trimming. Surfaced before any provider call, so an empty prompt never leaves the binary. Currently the only variant `CoderAgent::run` actually constructs (the placeholder body validates this and returns the literal string for everything else). |
 
-The `impl std::error::Error` lets the type widen into
-`Box<dyn Error>` in [main.rs:51](src/main.rs:51), where it joins
-`ConfigError` under one return type.
+`Display` writes them as:
 
-Variants get added when real failure modes appear: provider errors
-propagated, tool-call failures, planning loop limits, etc.
+| Variant | Message |
+|---|---|
+| `ProviderFailed(e)` | `"provider error: {e}"` (delegates to `ProviderError`'s own `Display`) |
+| `InvalidResponse(s)` | `"agent received invalid response: {s}"` |
+| `ContextLimitExceeded` | `"context limit exceeded"` |
+| `TaskEmpty` | `"task cannot be empty"` |
+
+`impl std::error::Error for AgentError {}` lets the type widen
+into `Box<dyn Error>` at [main.rs](src/main.rs) where it joins
+`ConfigError` and `ProviderError` under one return type.
+
+### `From<ProviderError>` conversion
+
+```rust
+impl From<ProviderError> for AgentError {
+    fn from(e: ProviderError) -> Self {
+        AgentError::ProviderFailed(e)
+    }
+}
+```
+
+This is what makes provider calls inside `run` ergonomic. With the
+`From` impl in place, any `?` on a method that returns
+`Result<_, ProviderError>` propagates as
+`Result<_, AgentError>` automatically — no manual `map_err`. So
+the real Coder body in the next step can write:
+
+```rust
+let response = provider.complete(messages).await?;  // ProviderError → AgentError::ProviderFailed
+```
+
+…rather than threading the error type by hand.
 
 ## `CoderAgent` — the placeholder
 
@@ -162,9 +187,12 @@ impl CoderAgent {
 impl Agent for CoderAgent {
     async fn run(
         &self,
-        _input: AgentInput,
+        input: AgentInput,
         _provider: &dyn ModelProvider,
     ) -> Result<AgentOutput, AgentError> {
+        if input.task.trim().is_empty() {
+            return Err(AgentError::TaskEmpty);
+        }
         Ok(AgentOutput {
             response: "Coder agent placeholder".to_string(),
         })
@@ -172,9 +200,13 @@ impl Agent for CoderAgent {
 }
 ```
 
-Both arguments are prefixed with `_` because the placeholder ignores
-them. When real logic lands the underscores get removed and the
-provider gets called.
+The body has one piece of real logic — an empty-task guard that
+short-circuits with [`AgentError::TaskEmpty`](#agenterror) before
+any provider call. Everything else is still placeholder: the
+`_provider` underscore-prefix suppresses the unused-argument
+warning until the real body wires it in, and the success path
+returns the literal `"Coder agent placeholder"` regardless of
+what `input.task` contains.
 
 The unit-struct shape (`pub struct CoderAgent;` — no fields) is
 right for a stateless placeholder. Real `CoderAgent` will likely
