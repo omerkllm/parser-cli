@@ -1,11 +1,15 @@
-#![allow(dead_code)]
 #![allow(clippy::enum_variant_names)]
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 
 use async_trait::async_trait;
 use futures::Stream;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::config::Config;
 
 /// The role of a message in a chat-completions conversation.
 ///
@@ -63,7 +67,7 @@ impl<'de> Deserialize<'de> for Role {
 /// `{"role": "...", "content": "..."}` object. Used both as input
 /// to [`ModelProvider::stream_completion`] and as the element type
 /// of [`crate::agents::AgentInput::conversation_history`].
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
@@ -111,20 +115,21 @@ impl std::error::Error for ProviderError {}
 /// models — a real provider only has to implement
 /// [`complete`](ModelProvider::complete).
 ///
-/// [`NoopProvider`] is the temporary compile stub used until the
-/// real OpenAI-compatible provider lands in the next step. Once
-/// that lands, `NoopProvider` is deleted and replaced.
+/// **Caller owns the system message.** The provider serializes
+/// whatever `Vec<Message>` it receives, including any system /
+/// developer turns the caller chose to prepend. Nothing is added
+/// implicitly.
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
-    /// The required method. Send a conversation to the model and
-    /// return the full response as a `String`.
-    ///
-    /// This is the only method an implementor *has* to write.
-    /// Convenient for tests, batch jobs, and any caller that
-    /// doesn't care about incremental output.
+    /// Send a conversation to the model and return the full
+    /// response as a `String`. A single blocking POST: the request
+    /// goes out, the full response comes back, no incremental
+    /// output. Convenient for tests, batch jobs, and any caller
+    /// that doesn't care about latency-to-first-token.
     async fn complete(&self, messages: Vec<Message>) -> Result<String, ProviderError>;
 
-    /// Stream the response back chunk-by-chunk.
+    /// Stream the response back chunk-by-chunk over Server-Sent
+    /// Events.
     ///
     /// Streaming is the right interface for the interactive CLI
     /// path because:
@@ -139,33 +144,388 @@ pub trait ModelProvider: Send + Sync {
     ///    decision log) can react to chunks as they arrive instead
     ///    of waiting for end-of-response.
     ///
+    /// Each yielded item is a `Result<String, ProviderError>`. An
+    /// `Err` mid-stream means the chunk could not be parsed or the
+    /// connection dropped — the caller decides whether to abort,
+    /// retry, or surface a partial response. The stream ends
+    /// naturally on the SSE `[DONE]` sentinel or when the
+    /// underlying byte stream is exhausted.
+    ///
     /// The default implementation calls
     /// [`complete`](ModelProvider::complete) and yields the full
     /// response as a single-item stream — correct behaviour, but
     /// none of the latency or cancellation benefits above. Real
-    /// streaming providers (the OpenAI-compatible HTTP impl
-    /// landing in the next step) override this to parse SSE
-    /// chunks as they arrive and yield each delta as soon as it's
-    /// decoded.
+    /// streaming providers override this.
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
-    ) -> Result<Pin<Box<dyn Stream<Item = String> + Send>>, ProviderError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>, ProviderError>
+    {
         let response = self.complete(messages).await?;
-        Ok(Box::pin(futures::stream::once(async move { response })))
+        Ok(Box::pin(futures::stream::once(async move { Ok(response) })))
     }
 }
 
-/// Temporary compile stub. Exists only to satisfy the type system
-/// while no real provider is implemented — `main` needs *some*
-/// `ModelProvider` value to pass to `agent.run()`. Returns an
-/// empty string from every call. Deleted in the next step when
-/// the real OpenAI-compatible provider lands.
-pub struct NoopProvider;
+/// OpenAI-compatible chat-completions provider.
+///
+/// Works with any endpoint that speaks the OpenAI chat-completions
+/// wire format: OpenRouter, OpenAI itself, Groq, Together AI,
+/// Ollama, LM Studio, and others. The endpoint URL, model name,
+/// API key, and sampling parameters all come from the user's
+/// `~/.parser/parser.config.toml` via [`Config`] — construct an
+/// `OpenAIProvider` with [`OpenAIProvider::from_config`] once at
+/// startup and reuse it for every request.
+///
+/// `HTTP-Referer` and `X-Title` are sent on every request. They're
+/// optional in the OpenAI spec but OpenRouter uses them to
+/// identify and rank apps in their public leaderboard — sending
+/// them is best practice for any tool talking to OpenRouter.
+pub struct OpenAIProvider {
+    endpoint: String,
+    model: String,
+    api_key: String,
+    max_tokens: u32,
+    temperature: f32,
+    client: reqwest::Client,
+}
+
+impl OpenAIProvider {
+    /// Build a provider from a validated [`Config`]. Clones the
+    /// four config fields the provider needs and constructs a fresh
+    /// `reqwest::Client`. Cheap; call once per process.
+    pub fn from_config(cfg: &Config) -> Self {
+        OpenAIProvider {
+            endpoint: cfg.model.endpoint.clone(),
+            model: cfg.model.name.clone(),
+            api_key: cfg.model.api_key.clone(),
+            max_tokens: cfg.parameters.max_tokens,
+            temperature: cfg.parameters.temperature,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Common request body for both [`complete`] and
+    /// [`stream_completion`]. The `stream` field is the only
+    /// difference between the two.
+    fn build_body(&self, messages: &[Message], stream: bool) -> Value {
+        let messages_json: Vec<Value> = messages
+            .iter()
+            .map(|m| {
+                json!({
+                    "role": m.role.to_string(),
+                    "content": m.content,
+                })
+            })
+            .collect();
+        json!({
+            "model": self.model,
+            "messages": messages_json,
+            "stream": stream,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+        })
+    }
+
+    fn url(&self) -> String {
+        format!("{}/chat/completions", self.endpoint)
+    }
+
+    fn auth_header(&self) -> String {
+        format!("Bearer {}", self.api_key)
+    }
+}
+
+/// Map a non-2xx HTTP response to a [`ProviderError`]. Status-code
+/// rules in one place so `complete` and `stream_completion` agree.
+async fn map_error_response(response: reqwest::Response) -> ProviderError {
+    let status = response.status();
+    match status.as_u16() {
+        401 => {
+            ProviderError::AuthError("invalid API key — run parser init to reconfigure".to_string())
+        }
+        402 => ProviderError::ApiError(
+            "insufficient credits — add credits at openrouter.ai/credits".to_string(),
+        ),
+        429 => ProviderError::ApiError("rate limited — wait a moment and try again".to_string()),
+        _ => {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read body: {}>", e));
+            ProviderError::ApiError(format!("HTTP {}: {}", status, body))
+        }
+    }
+}
 
 #[async_trait]
-impl ModelProvider for NoopProvider {
-    async fn complete(&self, _messages: Vec<Message>) -> Result<String, ProviderError> {
-        Ok(String::new())
+impl ModelProvider for OpenAIProvider {
+    async fn complete(&self, messages: Vec<Message>) -> Result<String, ProviderError> {
+        let body = self.build_body(&messages, false);
+        let response = self
+            .client
+            .post(self.url())
+            .header("Authorization", self.auth_header())
+            .header("Content-Type", "application/json")
+            .header("HTTP-Referer", "https://github.com/omerkllm/parser-cli")
+            .header("X-Title", "parser-cli")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(map_error_response(response).await);
+        }
+
+        let json: Value = response
+            .json()
+            .await
+            .map_err(|e| ProviderError::ApiError(format!("malformed JSON response: {}", e)))?;
+
+        json.get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                ProviderError::ApiError("response missing choices[0].message.content".to_string())
+            })
+    }
+
+    async fn stream_completion(
+        &self,
+        messages: Vec<Message>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>, ProviderError>
+    {
+        let body = self.build_body(&messages, true);
+        let response = self
+            .client
+            .post(self.url())
+            .header("Authorization", self.auth_header())
+            .header("Content-Type", "application/json")
+            .header("HTTP-Referer", "https://github.com/omerkllm/parser-cli")
+            .header("X-Title", "parser-cli")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(map_error_response(response).await);
+        }
+
+        // Box::pin the underlying byte stream so it's `Unpin`,
+        // which lets us call `.next().await` on it inside the
+        // unfold closure without pin-projecting through the tuple
+        // state.
+        let byte_stream = Box::pin(response.bytes_stream());
+
+        // State threaded through `unfold` as a tuple — type is
+        // inferred so we never have to name `bytes::Bytes`:
+        //   .0 byte_stream      pinned reqwest byte stream
+        //   .1 line_buffer      bytes that arrived without a
+        //                       trailing '\n' yet
+        //   .2 pending          parsed items not yet yielded (one
+        //                       network chunk can contain multiple
+        //                       SSE events; we buffer and drain
+        //                       one per unfold step)
+        //   .3 done             set once we hit `data: [DONE]` so
+        //                       the stream ends on the next poll
+        let initial = (
+            byte_stream,
+            String::new(),
+            VecDeque::<Result<String, ProviderError>>::new(),
+            false,
+        );
+
+        let stream = futures_util::stream::unfold(initial, |mut state| async move {
+            loop {
+                if let Some(item) = state.2.pop_front() {
+                    return Some((item, state));
+                }
+                if state.3 {
+                    return None;
+                }
+
+                match state.0.next().await {
+                    Some(Ok(bytes)) => {
+                        let chunk = String::from_utf8_lossy(&bytes);
+                        state.1.push_str(&chunk);
+
+                        while let Some(newline_idx) = state.1.find('\n') {
+                            let line: String = state.1.drain(..=newline_idx).collect();
+                            let line = line.trim_end_matches(['\r', '\n']);
+                            if line.is_empty() || line.starts_with(':') {
+                                continue;
+                            }
+                            let payload = match line.strip_prefix("data: ") {
+                                Some(p) => p,
+                                None => continue,
+                            };
+                            if payload == "[DONE]" {
+                                state.3 = true;
+                                continue;
+                            }
+                            match serde_json::from_str::<Value>(payload) {
+                                Ok(v) => {
+                                    if let Some(content) = v
+                                        .get("choices")
+                                        .and_then(|c| c.get(0))
+                                        .and_then(|c| c.get("delta"))
+                                        .and_then(|d| d.get("content"))
+                                        .and_then(|c| c.as_str())
+                                    {
+                                        if !content.is_empty() {
+                                            state.2.push_back(Ok(content.to_string()));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    state.2.push_back(Err(ProviderError::StreamError(format!(
+                                        "malformed SSE chunk: {}",
+                                        e
+                                    ))));
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        state.3 = true;
+                        return Some((Err(ProviderError::NetworkError(e.to_string())), state));
+                    }
+                    None => {
+                        state.3 = true;
+                        // Trailing content in line_buffer is dropped:
+                        // a well-formed SSE stream always ends with
+                        // a complete `data: [DONE]\n` line.
+                        if state.2.is_empty() {
+                            return None;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Build an `OpenAIProvider` pointed at a wiremock server.
+    fn mock_provider(server: &MockServer) -> OpenAIProvider {
+        OpenAIProvider {
+            endpoint: server.uri(),
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            max_tokens: 4096,
+            temperature: 0.7,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Proves that a 200 response with a well-formed
+    /// chat-completions body yields the inner content string from
+    /// `choices[0].message.content`.
+    #[tokio::test]
+    async fn complete_returns_content_on_200() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "hello" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = mock_provider(&server);
+        let result = provider
+            .complete(vec![Message {
+                role: Role::User,
+                content: "hi".to_string(),
+            }])
+            .await;
+
+        assert_eq!(result.unwrap(), "hello");
+    }
+
+    /// Proves that a 401 response is mapped to
+    /// `ProviderError::AuthError`, not `ApiError`. The CLI relies
+    /// on this distinction to suggest `parser init` instead of
+    /// dumping a raw body.
+    #[tokio::test]
+    async fn complete_returns_auth_error_on_401() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let provider = mock_provider(&server);
+        let err = provider.complete(vec![]).await.unwrap_err();
+
+        assert!(
+            matches!(err, ProviderError::AuthError(_)),
+            "expected AuthError, got: {:?}",
+            err
+        );
+    }
+
+    /// Proves that a 429 response is mapped to
+    /// `ProviderError::ApiError` with the rate-limit message.
+    #[tokio::test]
+    async fn complete_returns_api_error_on_429() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+
+        let provider = mock_provider(&server);
+        let err = provider.complete(vec![]).await.unwrap_err();
+
+        assert!(
+            matches!(err, ProviderError::ApiError(ref s) if s.contains("rate limited")),
+            "expected ApiError with 'rate limited', got: {:?}",
+            err
+        );
+    }
+
+    /// Proves that the SSE stream parser yields chunks in order
+    /// from the `data:` lines and stops cleanly at `data: [DONE]`.
+    /// Two chunks produce two `Ok(String)` items; concatenated
+    /// they reconstruct the full assistant response.
+    #[tokio::test]
+    async fn stream_completion_yields_chunks_in_order() {
+        let server = MockServer::start().await;
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n\
+                        data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n\
+                        data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = mock_provider(&server);
+        let stream = provider.stream_completion(vec![]).await.unwrap();
+        let items: Vec<Result<String, ProviderError>> = stream.collect().await;
+
+        let chunks: Vec<String> = items
+            .into_iter()
+            .map(|i| i.expect("each item is Ok"))
+            .collect();
+        assert_eq!(chunks.concat(), "hello");
     }
 }

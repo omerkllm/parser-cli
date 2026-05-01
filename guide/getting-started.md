@@ -1,9 +1,9 @@
 # Getting started
 
 Parser is a command-line AI coding agent: you type a task in plain
-English, it reads your config, and it asks an AI model to do the
-work. Today the agent is a placeholder that echoes a fixed reply —
-real model responses arrive in the next release.
+English, it reads your config, opens a streaming connection to an
+AI model, and prints the response token-by-token to your terminal
+as the model writes it.
 
 ## Prerequisites
 
@@ -33,8 +33,9 @@ cargo build --release
 
 This produces a single self-contained binary at
 `target/release/parser` (Linux/macOS) or
-`target/release/parser.exe` (Windows). It's about 1 MB and has
-no runtime dependencies.
+`target/release/parser.exe` (Windows). It's about 2.7 MB
+(rustls + reqwest add weight over the trait-only Step 1 build)
+and has no runtime dependencies.
 
 If you want to put it on your `PATH`, copy it to a directory
 that's already on your `PATH` (e.g. `~/.local/bin` on Linux,
@@ -99,29 +100,49 @@ profile script).
 ## Run your first task
 
 ```
-./target/release/parser run "fix the jwt bug"
+./target/release/parser run "write a hello world in rust"
 ```
 
-You'll see:
+What happens, in order:
+
+1. Parser reads `~/.parser/parser.config.toml` and validates it.
+2. It reads your `OPENROUTER_API_KEY` env var.
+3. It POSTs a chat-completions request to your configured
+   endpoint with `stream: true`.
+4. As the model emits tokens, Parser prints each one to your
+   terminal the moment it decodes it.
+
+You'll see something like:
 
 ```
-User: fix the jwt bug
+User: write a hello world in rust
 ─────────────────────────────
-Response: Coder agent placeholder
+Response: fn main() {
+    println!("Hello, world!");
+}
 ─────────────────────────────
 ```
 
-What the four lines mean:
+The four parts:
 
 - **`User: <task>`** — the task you typed, echoed back so you
   can confirm Parser received what you intended.
 - **First divider** — visual separator between input and output.
-- **`Response: <answer>`** — the model's reply. Right now this
-  is the literal placeholder string `"Coder agent placeholder"`.
-  When the real provider lands, this line shows what the model
-  actually wrote.
+- **`Response: <tokens stream here>`** — the model's reply. The
+  text appears one token at a time as the model writes it; you
+  don't wait for the full response.
 - **Closing divider** — marks end-of-response so subsequent
   output (errors, the next prompt) is visually distinct.
+
+If something goes wrong, the error path is also clean:
+
+| Scenario | Output |
+|---|---|
+| `OPENROUTER_API_KEY` not set | `error: environment variable OPENROUTER_API_KEY is not set` + `set it with: export OPENROUTER_API_KEY="your-api-key-here"`, exit code 1. |
+| Invalid API key (401) | `error: auth error: invalid API key — run parser init to reconfigure`, exit code 1. |
+| Out of credits (402) | `error: api error: insufficient credits — add credits at openrouter.ai/credits`, exit code 1. |
+| Rate limited (429) | `error: api error: rate limited — wait a moment and try again`, exit code 1. |
+| Connection drops mid-stream | The partial response stays on screen; `error: ...` and `Stream interrupted. Partial response shown above.` print to stderr, exit code 1. |
 
 You can also use the free-form short form (no `run` keyword):
 

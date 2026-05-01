@@ -1,8 +1,17 @@
+// The Coder agent and its support types are exercised by unit
+// tests in this module and are part of the library surface, but
+// `main.rs` streams directly through the provider for live token
+// output. From the binary's perspective these items are dead, so
+// silence the warnings module-wide rather than per-item.
 #![allow(dead_code)]
 
-use crate::providers::{Message, ModelProvider, ProviderError};
+use futures_util::StreamExt;
+
+use crate::providers::{Message, ModelProvider, ProviderError, Role};
 
 const MAX_TASK_LEN: usize = 32_768;
+
+const SYSTEM_PROMPT: &str = "You are an expert coding assistant. Be concise and direct.";
 
 pub struct AgentInput {
     pub task: String,
@@ -102,18 +111,21 @@ pub trait Agent {
     ) -> Result<AgentOutput, AgentError>;
 }
 
-/// Placeholder Coder agent. Validates that `input.task` is not
-/// empty (returning [`AgentError::TaskEmpty`] otherwise) and then
-/// returns the literal string `"Coder agent placeholder"`. The
-/// `_provider` argument is still ignored — the underscore prefix
-/// suppresses "unused argument" warnings until the real body
-/// wires it up.
+/// The Coder agent. Writes code and answers programming questions.
 ///
-/// The real implementation lands in the next step: build a system
-/// prompt, append `input.conversation_history` and the new task
-/// turn, call `provider.stream_completion(...)`, collect the
-/// chunks into `AgentOutput.response`. The trait signature stays
-/// the same — only this `impl` block changes.
+/// Today this is the only agent with a real implementation. It:
+///
+/// 1. Validates the task (trim, non-empty, length under the cap).
+/// 2. Builds the message list — system prompt first, then any
+///    `conversation_history` from the input, then the new user
+///    turn. The provider sends this list verbatim; nothing else
+///    is prepended on the wire.
+/// 3. Opens a streaming completion against the provider and
+///    accumulates the chunks into `AgentOutput.response`. A
+///    mid-stream `Err(ProviderError)` short-circuits with
+///    `AgentError::ProviderFailed`.
+/// 4. Surfaces `AgentError::InvalidResponse` if the model returned
+///    no content at all.
 pub struct CoderAgent;
 
 impl CoderAgent {
@@ -122,11 +134,17 @@ impl CoderAgent {
     }
 }
 
+impl Default for CoderAgent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Agent for CoderAgent {
     async fn run(
         &self,
         input: AgentInput,
-        _provider: &dyn ModelProvider,
+        provider: &dyn ModelProvider,
     ) -> Result<AgentOutput, AgentError> {
         let trimmed = input.task.trim();
         if trimmed.is_empty() {
@@ -138,8 +156,35 @@ impl Agent for CoderAgent {
                 max: MAX_TASK_LEN,
             });
         }
+
+        let mut messages: Vec<Message> = Vec::with_capacity(input.conversation_history.len() + 2);
+        messages.push(Message {
+            role: Role::System,
+            content: SYSTEM_PROMPT.to_string(),
+        });
+        messages.extend(input.conversation_history);
+        messages.push(Message {
+            role: Role::User,
+            content: trimmed.to_string(),
+        });
+
+        let mut stream = provider.stream_completion(messages).await?;
+        let mut collected = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => collected.push_str(&chunk),
+                Err(e) => return Err(AgentError::ProviderFailed(e)),
+            }
+        }
+
+        if collected.is_empty() {
+            return Err(AgentError::InvalidResponse(
+                "model returned empty response".to_string(),
+            ));
+        }
+
         Ok(AgentOutput {
-            response: "Coder agent placeholder".to_string(),
+            response: collected,
         })
     }
 }
@@ -147,7 +192,30 @@ impl Agent for CoderAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::NoopProvider;
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::pin::Pin;
+
+    /// In-test provider that never gets called by the existing
+    /// validation tests — they all bail out before reaching the
+    /// provider. Exists only to satisfy the `&dyn ModelProvider`
+    /// argument now that `NoopProvider` is gone.
+    struct StubProvider;
+
+    #[async_trait]
+    impl ModelProvider for StubProvider {
+        async fn complete(&self, _messages: Vec<Message>) -> Result<String, ProviderError> {
+            Ok(String::new())
+        }
+
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>, ProviderError>
+        {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
 
     /// Proves that a task containing only whitespace is treated
     /// as empty after `.trim()` and surfaces as
@@ -157,7 +225,7 @@ mod tests {
     #[tokio::test]
     async fn whitespace_only_task_returns_task_empty() {
         let agent = CoderAgent::new();
-        let provider = NoopProvider;
+        let provider = StubProvider;
         let input = AgentInput {
             task: "   \t \n  ".to_string(),
             conversation_history: Vec::new(),
@@ -180,7 +248,7 @@ mod tests {
     #[tokio::test]
     async fn task_longer_than_max_returns_task_too_long() {
         let agent = CoderAgent::new();
-        let provider = NoopProvider;
+        let provider = StubProvider;
         let big_task = "x".repeat(MAX_TASK_LEN + 1);
         let input = AgentInput {
             task: big_task,

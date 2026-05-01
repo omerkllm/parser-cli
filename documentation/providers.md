@@ -1,36 +1,42 @@
-# `src/providers/mod.rs` — ModelProvider trait + Message + ProviderError
+# `src/providers/mod.rs` — ModelProvider + OpenAIProvider + Message + ProviderError
 
-50 lines. Defines how Parser talks to a model. The architectural rule:
+Defines how Parser talks to a model. The architectural rule:
 **any OpenAI-compatible endpoint works**. The user supplies the URL,
 model name, and API-key env-var name in `parser.config.toml`; the
 binary stays unaware of which provider is on the other end.
 
-Today the module contains the trait shape and a throwaway
-`NoopProvider` stub. The real OpenAI-compatible HTTP implementation
-lands in Step 3.
+This module owns the `ModelProvider` trait, the wire-format types
+(`Message`, `Role`), the error enum (`ProviderError`), and the
+real `OpenAIProvider` that does HTTP and SSE.
 
 ## Imports
 
-[src/providers/mod.rs:1](src/providers/mod.rs:1):
-
 ```rust
+use std::collections::VecDeque;
 use std::pin::Pin;
 
 use async_trait::async_trait;
 use futures::Stream;
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::config::Config;
 ```
 
-Three imports that make the trait possible:
-
-- `std::pin::Pin` — the `Stream` trait requires self-pinning to
-  advance, so the boxed stream is wrapped in `Pin<Box<...>>`.
-- `async_trait::async_trait` — the macro that rewrites the trait
-  signature into something dyn-compatible.
-- `futures::Stream` — the trait every async stream implements.
+- `VecDeque` — buffers parsed SSE chunks the unfold closure hasn't
+  yielded yet (one network packet can carry several events).
+- `Pin` — the `Stream` trait requires self-pinning to advance, so
+  the boxed stream is wrapped in `Pin<Box<...>>`.
+- `async_trait` — rewrites the trait into a dyn-compatible shape.
+- `futures::Stream`, `futures_util::StreamExt` — the trait every
+  async stream implements, plus its `.next()` extension method.
+- `serde_json::{json, Value}` — `json!` builds the request body,
+  `Value` reads response fields without a typed schema.
+- `crate::config::Config` — `OpenAIProvider::from_config` reads
+  endpoint / model / api_key / max_tokens / temperature.
 
 ## `Role`
-
-[src/providers/mod.rs:9](src/providers/mod.rs:9):
 
 ```rust
 #[derive(Debug, Clone, Serialize)]
@@ -57,61 +63,23 @@ for the three roles the OpenAI chat-completions schema defines.
 | `Role::Assistant` | `"assistant"` | A turn previously emitted by the model. |
 | `Role::Other(String)` | the inner string | Any non-standard role a vendor may introduce — `"tool"`, `"function"`, `"developer"`, etc. The escape hatch keeps the type future-proof without baking every vendor's vocabulary into it. |
 
-The `Display` impl renders each variant as the lowercase wire string
-(`Role::System` → `"system"`, etc., and `Other(s)` → the raw `s`),
-which is what the OpenAI-compatible chat-completions schema expects
-in request bodies.
-
-### Serialization
-
-`Serialize` is derived. The per-variant `#[serde(rename = "...")]`
-attributes mean the three known variants serialize directly to the
-lowercase JSON strings the OpenAI schema requires:
-
-- `Role::System` → JSON string `"system"`
-- `Role::User` → JSON string `"user"`
-- `Role::Assistant` → JSON string `"assistant"`
-
-(`Role::Other("tool")` falls back to the default externally-tagged
-form `{"Other":"tool"}` — fine for an internal decision-log dump,
-but if a future vendor needs a raw-string `Other` on the wire the
-real provider in Step 2 should `Display` the role explicitly when
-building the request body rather than relying on the derive.)
+The `Display` impl renders each variant as the lowercase wire string.
+`OpenAIProvider::build_body` calls `role.to_string()` rather than
+`serde_json::to_value(&role)` precisely because the derived
+`Serialize` produces `{"Other":"..."}` for the tuple variant — wrong
+on the wire.
 
 ### Deserialization
 
 `Deserialize` is implemented manually rather than derived. The
 incoming string is matched against the three known variants and
 falls through to `Role::Other(s)` for anything else, so a vendor
-sending `"role": "tool"` in a response round-trips cleanly without
-needing the type to know about it ahead of time:
-
-```rust
-impl<'de> Deserialize<'de> for Role {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        Ok(match s.as_str() {
-            "system"    => Role::System,
-            "user"      => Role::User,
-            "assistant" => Role::Assistant,
-            _           => Role::Other(s),
-        })
-    }
-}
-```
-
-A derived `Deserialize` would produce externally-tagged JSON for
-`Other` (`{"Other":"..."}`), which doesn't match how role strings
-arrive on the wire. The manual impl keeps deserialization symmetric
-with the renamed-variant serialization for the three known roles
-and graceful for everything else.
+sending `"role": "tool"` in a response round-trips cleanly.
 
 ## `Message`
 
-[src/providers/mod.rs:30](src/providers/mod.rs:30):
-
 ```rust
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
@@ -122,25 +90,12 @@ The canonical role/content pair used everywhere a conversation turn
 is represented:
 
 - **Wire format.** Sent to the provider as part of a chat-completions
-  request body. With `Serialize` derived, the struct goes straight
-  through `serde_json::to_vec` without manual marshalling.
+  request body. `OpenAIProvider::build_body` re-serializes via
+  `role.to_string()` to dodge the `Other` problem above.
 - **Agent input.** [`AgentInput::conversation_history`](agents.md#agentinput)
   is `Vec<Message>` — the same struct, imported from this module.
-- **Future: decision log.** Step 7's compressor will likely store
-  `Message` records too; `Deserialize` makes round-tripping free.
-
-`content` is the message text. For Step 2 it's plain text; later
-steps may carry tool-call payloads, image references, or structured
-content — at which point the field shape changes here, in one place,
-and consumers track the change.
-
-The struct lives in this module rather than in `agents/` because the
-provider layer is the canonical owner of wire-format concerns. The
-agents module imports it (see [agents.md](agents.md#agentinput)).
 
 ## `ProviderError`
-
-[src/providers/mod.rs:11](src/providers/mod.rs:11):
 
 ```rust
 #[derive(Debug)]
@@ -157,224 +112,219 @@ into a bug report:
 
 | Variant | When it fires |
 |---|---|
-| `ApiError` | The endpoint returned a non-2xx response with a parsable error body. The `String` holds the body (or a useful slice of it). |
-| `NetworkError` | The request never reached the endpoint, or the connection dropped. DNS failure, TLS handshake error, refused connection, timeout. |
-| `AuthError` | 401 / 403 from the endpoint, or the API-key env var was missing. Surfaced separately so the CLI can suggest `parser init` or `export MY_API_KEY=...`. |
-| `StreamError` | The request succeeded and a stream began, but a chunk failed to parse — malformed SSE, dropped mid-response, encoding mismatch. |
+| `ApiError` | The endpoint returned a non-2xx response other than 401. The string is either a tailored message (402: insufficient credits; 429: rate limited) or `"HTTP {status}: {body}"` for everything else. |
+| `NetworkError` | The request never reached the endpoint, or the byte-stream dropped mid-response: DNS failure, TLS handshake error, refused connection, timeout. |
+| `AuthError` | 401 from the endpoint. Surfaced separately so the CLI can suggest `parser init` to reconfigure rather than dumping a raw body. |
+| `StreamError` | A streaming SSE chunk arrived but the `data: …` JSON couldn't be parsed (`malformed SSE chunk: ...`). |
 
 The `Display` impl writes them as `"api error: ..."`,
 `"network error: ..."`, etc. `std::error::Error` is implemented so
 the type widens cleanly into `Box<dyn Error>` in
-[main.rs:51](src/main.rs:51) alongside `ConfigError` and
-`AgentError`.
+[main.rs](../src/main.rs) alongside `ConfigError` and `AgentError`.
 
 ## The `ModelProvider` trait
-
-[src/providers/mod.rs:117](src/providers/mod.rs:117):
 
 ```rust
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
-    /// The required method.
     async fn complete(
         &self,
         messages: Vec<Message>,
     ) -> Result<String, ProviderError>;
 
-    /// Optional override. Default impl wraps complete().
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
-    ) -> Result<Pin<Box<dyn Stream<Item = String> + Send>>, ProviderError> {
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>,
+        ProviderError,
+    > {
         let response = self.complete(messages).await?;
-        Ok(Box::pin(futures::stream::once(async move { response })))
+        Ok(Box::pin(futures::stream::once(async move { Ok(response) })))
     }
 }
 ```
+
+### Caller owns the system message
+
+The provider serializes whatever `Vec<Message>` it receives —
+nothing is added implicitly. Callers (today: `main.rs` and
+`CoderAgent::run`) are responsible for prepending a `Role::System`
+turn if they want one. This keeps the trait contract narrow: a
+provider is a transport, not a prompt-injection layer.
 
 ### `complete` vs `stream_completion`
 
-The trait exposes two methods that return the same conceptual
-result — the model's reply to a conversation — at different
-granularities:
-
-| Method | Returns | When to call | When to override |
-|---|---|---|---|
-| `complete` | `Result<String, ProviderError>` — the full response in one piece. | Tests, batch jobs, anywhere the caller wants the whole answer in one chunk and doesn't care about latency-to-first-token. | **Always.** This is the single required method. Every implementor must write a real `complete`. |
-| `stream_completion` | `Result<Pin<Box<dyn Stream<Item = String> + Send>>, ProviderError>` — chunks yielded as they arrive. | The interactive CLI path, where users want to see tokens land as soon as they're decoded. | Only when the underlying transport supports streaming (OpenAI-style SSE chunks). The default implementation calls `complete` and yields the whole response as a single-item stream — semantically correct, but with none of streaming's latency or cancellation benefits. |
+| Method | Returns | When |
+|---|---|---|
+| `complete` | `Result<String, ProviderError>` — the full response in one piece. | Tests, batch jobs, any caller that wants the whole answer at once. |
+| `stream_completion` | `Result<Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>, ProviderError>` — chunks yielded as they arrive. | The interactive CLI path. |
 
 The split lets a minimal provider (a fixture, a mock, a non-streaming
 backend) implement only `complete` and inherit a working
-`stream_completion` for free, while a real OpenAI-compatible HTTP
-provider overrides `stream_completion` to parse SSE deltas.
+`stream_completion` for free.
 
-The default implementation is exactly:
+### Why `Stream<Item = Result<String, ProviderError>>` and not `Item = String`
 
-```rust
-let response = self.complete(messages).await?;
-Ok(Box::pin(futures::stream::once(async move { response })))
-```
+A streaming SSE response can fail mid-flight in two ways the caller
+needs to distinguish:
 
-`futures::stream::once` builds a `Stream` that yields a single
-`Item` and then ends. `Box::pin` matches the trait's return
-signature.
+1. **Malformed JSON in a `data:` line.** The provider yields
+   `Err(ProviderError::StreamError(...))`. The caller decides
+   whether to abort, log and continue, or surface a partial response.
+2. **The byte stream itself drops.** The provider yields
+   `Err(ProviderError::NetworkError(...))` and ends.
 
-Four pieces are doing real work in the trait declaration itself:
+If items were bare `String`, both cases would be indistinguishable
+from a clean end-of-stream — the user would silently lose data. The
+`main.rs` loop uses this distinction to print
+`"Stream interrupted. Partial response shown above."` when bytes
+had already streamed before the error.
 
-### `#[async_trait]`
+### The `Send + Sync` supertraits
 
-Why the macro instead of native `async fn`? The `Agent` trait gets
-to use native async fn because it's only ever statically dispatched
-(see [agents.md](agents.md#1-native-async-fn-in-trait--no-macro)).
-`ModelProvider` is different:
+A provider implementation must be safe to share across threads. Even
+though Parser uses tokio's `current_thread` runtime today, the
+provider may be borrowed by spawned tasks (the indexer in a later
+step is likely to need this).
 
-1. The agent borrows the provider as `&dyn ModelProvider`. That
-   requires the trait to be **dyn-compatible**.
-2. The return type is `Pin<Box<dyn Stream<Item = String> + Send>>` —
-   a heap-allocated, pinned, dynamically-typed stream.
-
-Both are exactly what `#[async_trait]` was built for. Native async
-fn in dyn-compatible traits is gaining ground in Rust but still has
-caveats; the macro produces predictable, well-trodden code today.
-
-The macro rewrites `async fn ...` into roughly:
+## `OpenAIProvider` — the real implementation
 
 ```rust
-fn stream_completion<'a>(
-    &'a self,
-    messages: Vec<Message>,
-) -> Pin<Box<dyn Future<Output = Result<...>> + Send + 'a>>;
-```
-
-You don't see this — but it's why the trait is dyn-compatible.
-
-### `Send + Sync` supertraits
-
-A provider implementation must be safe to share across threads.
-Even though Parser uses tokio's `current_thread` runtime today, the
-provider may be borrowed by spawned tasks (Step 5+'s indexer is
-likely to need this). The bound is cheap to enforce now; removing
-it later would be a breaking change for implementors.
-
-### `messages: Vec<Message>` taken by value
-
-Owned because the provider often needs to mutate the conversation
-(adding system prompts, formatting role markers) before sending it
-on the wire. Borrowing would force every caller to clone.
-
-### The return type
-
-`Pin<Box<dyn Stream<Item = String> + Send>>` deserves unpacking:
-
-- **`String`** — each item is a chunk of decoded text from the model.
-  The provider is responsible for parsing the wire format (typically
-  Server-Sent Events for OpenAI-compatible APIs) and yielding clean
-  strings.
-- **`+ Send`** — chunks must cross thread boundaries cleanly so the
-  stream can be polled from a spawned task.
-- **`Box<dyn Stream<...>>`** — the concrete stream type depends on
-  the HTTP client library; boxing erases it so the trait signature
-  stays stable across implementations.
-- **`Pin<...>`** — `Stream::poll_next` requires the stream to not
-  move between calls; pinning the box gives that guarantee.
-
-## Why streaming
-
-Tokens arrive incrementally from a model, often over hundreds of
-milliseconds to many seconds. Three reasons to expose them as a
-stream rather than blocking until completion:
-
-1. **Latency to first token.** The user sees output almost
-   immediately rather than after a long pause.
-2. **Cancellation.** If the user kills a task, the stream can be
-   dropped and the HTTP connection closed; no wasted compute or API
-   credits.
-3. **Compositionality.** The Compressor (Step 8+) will want to emit
-   intermediate state as it works. A stream-first interface keeps
-   that path simple.
-
-The agent layer collects chunks into a single
-`AgentOutput.response` today; later steps may push streaming up to
-the CLI for live token display.
-
-## `NoopProvider` — the stub
-
-[src/providers/mod.rs:148](src/providers/mod.rs:148):
-
-```rust
-pub struct NoopProvider;
-
-#[async_trait]
-impl ModelProvider for NoopProvider {
-    async fn complete(
-        &self,
-        _messages: Vec<Message>,
-    ) -> Result<String, ProviderError> {
-        Ok(String::new())
-    }
+pub struct OpenAIProvider {
+    endpoint: String,
+    model: String,
+    api_key: String,
+    max_tokens: u32,
+    temperature: f32,
+    client: reqwest::Client,
 }
 ```
 
-A throwaway implementation that returns an empty string from
-`complete`. It exists for one reason: the trait shape ships now,
-but the real HTTP-talking implementation lands in the next step.
-Without `NoopProvider`, [main.rs](src/main.rs) couldn't fill the
-`&dyn ModelProvider` slot when calling `agent.run(...)` — the
-binary wouldn't compile.
+Works with any endpoint that speaks the OpenAI chat-completions
+wire format: OpenRouter, OpenAI itself, Groq, Together AI, Ollama,
+LM Studio, and others. The five fields are copied from the
+validated [`Config`](config.md) at startup.
 
-`NoopProvider` only implements `complete`. Calls to
-`stream_completion` go through the trait's default implementation,
-which awaits `complete` (`Ok(String::new())`) and wraps the empty
-string in `futures::stream::once`. The resulting stream yields a
-single empty string and then ends. That's a slight behaviour
-change from the previous `futures::stream::empty()` version (which
-yielded zero items) but matches the intent: "the provider has
-nothing to say, but it didn't fail."
+### Construction
 
-The next step deletes both the `NoopProvider` struct and its
-`impl` block.
+```rust
+pub fn from_config(cfg: &Config) -> Self
+```
 
-## What this module deliberately doesn't do (yet)
+Cheap; call once per process. `reqwest::Client::new()` is the
+default client — no custom timeout, no retries, no proxy
+configuration. Those land if and when they're needed.
 
-- **No HTTP client.** No `reqwest`, no `hyper`, no socket setup.
-- **No request body construction.** OpenAI's chat-completions schema
-  isn't built here; that's Step 3.
-- **No SSE parsing.** Same.
-- **No retries, no rate limiting, no backoff.** Same.
-- **No mock provider for tests.** When tests exist that exercise the
-  agent layer, a `MockProvider` will live next to the test code, not
-  in the production module.
-- **No structured tool-call output.** `Stream<Item = String>` is the
-  current shape; if tool-use lands later, this becomes
-  `Stream<Item = StreamChunk>` where `StreamChunk` is an enum of
-  text/tool-call/error variants. Non-breaking change, since callers
-  already have to match on what comes back.
+### Request body
 
-## Step 3 preview — what the real impl will add
+```json
+{
+  "model": "{model}",
+  "messages": [...],
+  "stream": false,
+  "max_tokens": {max_tokens},
+  "temperature": {temperature}
+}
+```
 
-A new file or a new struct in this same file (TBD) will:
+`stream` is the only difference between the body sent by `complete`
+(false) and `stream_completion` (true). Everything else is shared
+via the private `build_body` helper.
 
-1. Define an `OpenAICompatibleProvider` struct holding endpoint URL,
-   model name, API key, and an HTTP client (`reqwest` is the likely
-   pick).
-2. Provide a constructor that reads from `Config` and validates inputs.
-3. Implement `stream_completion`:
-   - Build a chat-completions request body with the messages plus
-     `stream: true`.
-   - POST to `{endpoint}/chat/completions` with the API key as a
-     bearer token.
-   - Parse the SSE response stream, yielding each delta's content as
-     a `String`.
-   - Map errors to the right `ProviderError` variant based on HTTP
-     status, network failure mode, or parse error.
-4. Delete `NoopProvider`.
+### Headers
+
+| Header | Value | Purpose |
+|---|---|---|
+| `Authorization` | `Bearer {api_key}` | Standard chat-completions auth. |
+| `Content-Type` | `application/json` | What the body is. |
+| `HTTP-Referer` | `https://github.com/omerkllm/parser-cli` | Identifies the calling app. **OpenRouter-specific** — used to rank the app in their public leaderboard. Optional in the OpenAI spec; recommended for any tool talking to OpenRouter. |
+| `X-Title` | `parser-cli` | Same as above — OpenRouter shows this as the app name in user-visible dashboards. |
+
+### Status mapping
+
+The mapping is identical for `complete` and `stream_completion`'s
+pre-stream status check:
+
+| Status | Variant | Message |
+|---|---|---|
+| 200 | (parsed) | — |
+| 401 | `AuthError` | `"invalid API key — run parser init to reconfigure"` |
+| 402 | `ApiError` | `"insufficient credits — add credits at openrouter.ai/credits"` |
+| 429 | `ApiError` | `"rate limited — wait a moment and try again"` |
+| other 4xx/5xx | `ApiError` | `"HTTP {status}: {body}"` (body fetched via `response.text()`) |
+| send error | `NetworkError` | `e.to_string()` from reqwest |
+
+### `complete` — the blocking path
+
+POSTs the request, parses the response as `serde_json::Value`,
+walks `choices[0].message.content` and returns it as a `String`.
+A response with the right status but a missing field returns
+`ApiError("response missing choices[0].message.content")`.
+
+### `stream_completion` — the SSE path
+
+After the same pre-flight status check, the response body is read
+via `response.bytes_stream()`. The byte stream is wrapped in
+`futures_util::stream::unfold` with four pieces of state threaded
+through (a tuple — type inferred so we never have to name
+`bytes::Bytes`):
+
+1. **The pinned byte stream itself.** `Box::pin` makes it `Unpin`,
+   which lets the unfold closure call `.next().await` on it
+   without manual pin-projection.
+2. **A line buffer (`String`).** Bytes that arrived without a
+   trailing `\n` yet — the next chunk completes them.
+3. **A `VecDeque<Result<String, ProviderError>>` of pending items.**
+   One network chunk can contain multiple SSE events; we buffer
+   them and drain one per unfold step.
+4. **A `done` flag.** Set when we hit `data: [DONE]` so the next
+   poll ends the stream.
+
+The line-parser strips `\r\n`, ignores empty lines and SSE
+comments (lines starting with `:`), recognizes `data: [DONE]` as
+the end-of-stream sentinel, and parses every other `data: <json>`
+line into a `Value`. From the parsed JSON, it walks
+`choices[0].delta.content` and yields it as `Ok(String)` if
+non-null, non-empty.
+
+JSON parse failures emit `Err(ProviderError::StreamError(...))`;
+byte-stream failures from reqwest emit
+`Err(ProviderError::NetworkError(...))` and end the stream.
+
+## Tests
+
+`#[cfg(test)] mod tests` uses [`wiremock`](https://docs.rs/wiremock)
+to spin up a local HTTP server and verify the four critical paths.
+
+| Test | Proves |
+|---|---|
+| `complete_returns_content_on_200` | A 200 response with a well-formed body yields the inner `choices[0].message.content` string. |
+| `complete_returns_auth_error_on_401` | A 401 maps to `ProviderError::AuthError`, not `ApiError` — the CLI's "run parser init" suggestion depends on this. |
+| `complete_returns_api_error_on_429` | A 429 maps to `ApiError` carrying the `"rate limited"` message. |
+| `stream_completion_yields_chunks_in_order` | An SSE body with two `data:` chunks plus `[DONE]` yields two `Ok(String)` items in order; concatenated they reconstruct the full assistant response. |
+
+The tests build an `OpenAIProvider` directly with the wiremock
+URI — `from_config` is bypassed because the tests don't need a
+full `Config`.
+
+## What this module deliberately doesn't do
+
+- **No retries, no rate-limiting, no exponential backoff.** A 429
+  fails fast with a useful message; orchestration logic for
+  retrying lives at a higher layer.
+- **No timeout on the reqwest client.** Defaults apply.
+- **No tool-calling, no function-calling, no JSON mode.** Plain
+  text in, plain text out.
+- **No image / vision support.** `Message.content` is `String`.
+- **No structured tool-call output in the stream.** Items are
+  text deltas only; if tool-use lands later, the `Stream<Item>`
+  type widens to an enum.
 
 ## Cross-references
 
-- [agents.md](agents.md) — the consumer of this trait. Specifically,
-  the section on why `Agent` uses native async fn while
-  `ModelProvider` uses `#[async_trait]`.
-- [config.md](config.md) — where `endpoint`, `name`, `api_key`, and
-  `parameters.*` come from at construction time.
-- [main.md](main.md) — where `NoopProvider` gets instantiated today.
-- [04-toolchain.md](04-toolchain.md) — `async-trait` and `futures` deps.
+- [agents.md](agents.md) — the consumer of this trait.
+- [config.md](config.md) — where every field on `OpenAIProvider`
+  comes from.
+- [main.md](main.md) — where `OpenAIProvider::from_config` and
+  `stream_completion` get called for the live CLI path.

@@ -1,9 +1,17 @@
-# `src/agents/mod.rs` — Agent trait + CoderAgent placeholder
+# `src/agents/mod.rs` — Agent trait + CoderAgent
 
-50 lines. Defines the shape every reasoning role in Parser shares.
-Today there is one role with a placeholder body (`CoderAgent`); four
-more roles will land later as separate `impl Agent` blocks against
-the same trait.
+Defines the shape every reasoning role in Parser shares. Today
+there is one real implementation (`CoderAgent`); four more roles
+will land later as separate `impl Agent` blocks against the same
+trait.
+
+The agent layer is exercised today only by its own unit tests.
+The interactive CLI path in [main.md](main.md) bypasses the agent
+and streams directly through the provider, because the agent's
+collect-to-string contract can't express live token-by-token
+output. The agent remains the right call path for any caller that
+wants the full response as a single `String` (programmatic use,
+batch jobs).
 
 ## Roles planned
 
@@ -174,25 +182,22 @@ let response = provider.complete(messages).await?;  // ProviderError → AgentEr
 
 …rather than threading the error type by hand.
 
-## `CoderAgent` — the placeholder
-
-[src/agents/mod.rs:31](src/agents/mod.rs:31):
+## `CoderAgent` — the real implementation
 
 ```rust
 pub struct CoderAgent;
 
 impl CoderAgent {
-    pub fn new() -> Self {
-        CoderAgent
-    }
+    pub fn new() -> Self { CoderAgent }
 }
 
 impl Agent for CoderAgent {
     async fn run(
         &self,
         input: AgentInput,
-        _provider: &dyn ModelProvider,
+        provider: &dyn ModelProvider,
     ) -> Result<AgentOutput, AgentError> {
+        // 1. Validate the task.
         let trimmed = input.task.trim();
         if trimmed.is_empty() {
             return Err(AgentError::TaskEmpty);
@@ -203,32 +208,65 @@ impl Agent for CoderAgent {
                 max: MAX_TASK_LEN,
             });
         }
-        Ok(AgentOutput {
-            response: "Coder agent placeholder".to_string(),
-        })
+
+        // 2. Build the message list — system prompt first, then
+        //    any prior conversation_history, then the new user
+        //    turn. The provider sends this list verbatim.
+        let mut messages: Vec<Message> =
+            Vec::with_capacity(input.conversation_history.len() + 2);
+        messages.push(Message {
+            role: Role::System,
+            content: SYSTEM_PROMPT.to_string(),
+        });
+        messages.extend(input.conversation_history);
+        messages.push(Message {
+            role: Role::User,
+            content: trimmed.to_string(),
+        });
+
+        // 3. Open the streaming completion and accumulate.
+        let mut stream = provider.stream_completion(messages).await?;
+        let mut collected = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => collected.push_str(&chunk),
+                Err(e) => return Err(AgentError::ProviderFailed(e)),
+            }
+        }
+
+        // 4. Empty completion → InvalidResponse.
+        if collected.is_empty() {
+            return Err(AgentError::InvalidResponse(
+                "model returned empty response".to_string(),
+            ));
+        }
+        Ok(AgentOutput { response: collected })
     }
 }
 ```
 
-The body has two pieces of real logic, both input validation:
+Four phases:
 
-1. **Empty-task guard.** `input.task.trim()` strips leading and
-   trailing whitespace; if the remainder is empty the run
-   short-circuits with [`AgentError::TaskEmpty`](#agenterror).
-   This means `"    "` fails the same as `""` — the check looks
-   at semantic content, not raw character count.
-2. **Length cap.** If the trimmed task exceeds `MAX_TASK_LEN`
-   (32,768 characters), the run short-circuits with
-   [`AgentError::TaskTooLong`](#agenterror) carrying the actual
-   length and the max. Catches pathological inputs (a multi-MB
-   prompt accidentally piped in) before they ever reach the
-   provider's request body.
-
-Everything else is still placeholder: the `_provider`
-underscore-prefix suppresses the unused-argument warning until
-the real body wires it in, and the success path returns the
-literal `"Coder agent placeholder"` regardless of what
-`input.task` contains.
+1. **Validation.** `input.task.trim()` strips whitespace; an empty
+   remainder returns `TaskEmpty`, a too-long remainder returns
+   `TaskTooLong`. Catches pathological inputs (a multi-MB prompt
+   accidentally piped in) before they ever reach the provider's
+   request body.
+2. **Message construction.** The hard-coded `SYSTEM_PROMPT`
+   ("You are an expert coding assistant. Be concise and direct.")
+   is prepended; the caller's `conversation_history` follows in
+   order; the new user turn is appended last. The provider does
+   not add anything implicitly — see [providers.md](providers.md#caller-owns-the-system-message).
+3. **Streaming + accumulation.** `provider.stream_completion(...)`
+   returns a `Stream<Item = Result<String, ProviderError>>`. Each
+   `Ok(chunk)` is appended; the first `Err(_)` short-circuits with
+   `AgentError::ProviderFailed`. The `?` on `stream_completion`
+   itself handles pre-stream failures (auth / network / API
+   status) via the `From<ProviderError>` impl below.
+4. **Empty-response guard.** If the stream ended cleanly but
+   produced no chunks, return `InvalidResponse`. Catches the case
+   where the model returned a 200 with no content — rare but
+   possible with some endpoints under throttling.
 
 ## Tests
 
@@ -240,35 +278,33 @@ Two unit tests in `#[cfg(test)] mod tests`, both using
 | `whitespace_only_task_returns_task_empty` | A task of just spaces/tabs/newlines fails the same as `""`, returning `AgentError::TaskEmpty`. |
 | `task_longer_than_max_returns_task_too_long` | A task longer than `MAX_TASK_LEN` after trimming returns `AgentError::TaskTooLong { length, max }` carrying the actual lengths so the user sees how much to trim. |
 
-Both tests use `NoopProvider` for the `&dyn ModelProvider` slot;
-the validation runs before any provider call, so the noop never
-gets invoked.
+Both tests use a private in-test `StubProvider` for the
+`&dyn ModelProvider` slot. The validation runs before any provider
+call, so the stub's `complete` / `stream_completion` bodies never
+get invoked — `StubProvider` exists purely to satisfy the type
+signature. It returns `Ok(String::new())` and an empty stream
+respectively.
 
 The unit-struct shape (`pub struct CoderAgent;` — no fields) is
-right for a stateless placeholder. Real `CoderAgent` will likely
-carry configuration: model name override, temperature, system prompt
+right for a stateless agent today. A future `CoderAgent` may carry
+configuration: model name override, temperature, system prompt
 template, retry policy. Those fields get added when they earn their
 keep.
 
 ## How the agent is wired into main
 
-From [main.rs:57](src/main.rs:57):
+The agent is **not** wired into main today. `main.rs::run_task`
+streams directly through the provider so the user sees tokens
+land as they arrive — the agent's collect-to-string contract
+buffers the full response before returning, which would defeat
+the streaming UX. See [main.md](main.md).
 
-```rust
-let agent = CoderAgent::new();
-let provider = NoopProvider;
-let input = AgentInput {
-    task: task.to_string(),
-    conversation_history: Vec::new(),
-};
-let output = agent.run(input, &provider).await?;
-println!("{}", output.response);
-```
-
-`NoopProvider` is the throwaway stub that satisfies the
-`&dyn ModelProvider` slot until Step 3's real OpenAI-compatible
-provider replaces it. See
-[providers.md](providers.md#noopprovider).
+The agent remains exercised by its own unit tests and is the
+right entry point for any caller that wants the full response
+as a single `String` (programmatic use, batch jobs, future
+multi-agent orchestration). The trait-based design means
+swapping in real provider implementations doesn't change the
+agent's call site.
 
 ## Adding a new agent
 

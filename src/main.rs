@@ -1,11 +1,16 @@
+use std::io::Write;
+
 use clap::{Parser, Subcommand};
+use futures_util::StreamExt;
 
 mod agents;
 mod config;
 mod providers;
 
-use agents::{Agent, AgentInput, CoderAgent};
-use providers::NoopProvider;
+use providers::{Message, ModelProvider, OpenAIProvider, Role};
+
+const SYSTEM_PROMPT: &str = "You are an expert coding assistant. Be concise and direct.";
+const MAX_TASK_LEN: usize = 32_768;
 
 #[derive(Parser)]
 #[command(name = "parser")]
@@ -48,37 +53,105 @@ async fn main() {
     }
 }
 
-/// Execute a coding task end-to-end.
+/// Execute a coding task end-to-end with live streaming output.
 ///
-/// Today this loads the user's config (so validation runs), then
-/// instantiates a [`CoderAgent`] paired with a [`NoopProvider`]
-/// and runs the agent — which currently just returns the
-/// placeholder string `"Coder agent placeholder"`. The output is
-/// the user's task, a divider, the agent's response, and a
-/// closing divider.
+/// Loads the validated [`config::Config`], constructs an
+/// [`OpenAIProvider`] from it, opens an SSE stream against
+/// `{endpoint}/chat/completions`, and prints each incoming chunk
+/// to stdout as it arrives — the user sees tokens appear in real
+/// time rather than after a long pause.
 ///
-/// The next step replaces [`NoopProvider`] with the real
-/// OpenAI-compatible provider and replaces `CoderAgent::run`'s
-/// placeholder body with a real call to
-/// [`ModelProvider::stream_completion`](crate::providers::ModelProvider::stream_completion).
-/// The body of this function does not change — the provider is
-/// already trait-dispatched, so swapping the concrete type is
-/// the only edit needed at the call site.
+/// The agent layer is bypassed here: streaming straight from the
+/// provider keeps the print-on-arrival behaviour the agent's
+/// collect-to-string contract can't express. [`agents::CoderAgent`]
+/// remains the call path for any caller that wants the full
+/// response as a single `String` (tests, programmatic use).
+///
+/// Output format:
+///
+/// ```text
+/// User: <task>
+/// ─────────────────────────────
+/// Response: <tokens stream here>
+/// ─────────────────────────────
+/// ```
+///
+/// Errors:
+/// - Empty / whitespace-only task → `task cannot be empty`, exit 1.
+/// - Task longer than [`MAX_TASK_LEN`] → length-and-max message,
+///   exit 1.
+/// - Auth / API / network / stream errors from the provider are
+///   caught and printed via the top-level handler in [`main`].
+/// - Mid-stream `Err(ProviderError)` ends the stream, prints
+///   `Stream interrupted. Partial response shown above.` if any
+///   bytes had already been streamed, exit 1.
+/// - Empty completion (stream ended cleanly with no chunks) prints
+///   `The model returned an empty response. Try rephrasing your
+///   task.`, exit 1.
 async fn run_task(task: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let _cfg = config::Config::load()?;
+    let trimmed = task.trim();
+    if trimmed.is_empty() {
+        eprintln!("error: task cannot be empty");
+        std::process::exit(1);
+    }
+    if trimmed.len() > MAX_TASK_LEN {
+        eprintln!(
+            "error: task is {} characters, maximum is {}",
+            trimmed.len(),
+            MAX_TASK_LEN
+        );
+        std::process::exit(1);
+    }
 
-    let agent = CoderAgent::new();
-    let provider = NoopProvider;
-    let input = AgentInput {
-        task: task.to_string(),
-        conversation_history: Vec::new(),
-    };
-    let output = agent.run(input, &provider).await?;
+    let cfg = config::Config::load()?;
+    let provider = OpenAIProvider::from_config(&cfg);
+
+    let messages = vec![
+        Message {
+            role: Role::System,
+            content: SYSTEM_PROMPT.to_string(),
+        },
+        Message {
+            role: Role::User,
+            content: trimmed.to_string(),
+        },
+    ];
 
     let divider = "─".repeat(29);
-    println!("User: {}", task);
+    println!("User: {}", trimmed);
     println!("{}", divider);
-    println!("Response: {}", output.response);
+
+    // Open the stream first so a pre-stream failure (auth /
+    // network / API) propagates via `?` cleanly, without leaving
+    // a half-printed "Response: " line on stdout.
+    let mut stream = provider.stream_completion(messages).await?;
+    print!("Response: ");
+    std::io::stdout().flush().ok();
+
+    let mut collected = String::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(chunk) => {
+                print!("{}", chunk);
+                std::io::stdout().flush().ok();
+                collected.push_str(&chunk);
+            }
+            Err(e) => {
+                println!();
+                eprintln!("error: {}", e);
+                if !collected.is_empty() {
+                    eprintln!("Stream interrupted. Partial response shown above.");
+                }
+                std::process::exit(1);
+            }
+        }
+    }
+
+    println!();
+    if collected.is_empty() {
+        eprintln!("The model returned an empty response. Try rephrasing your task.");
+        std::process::exit(1);
+    }
     println!("{}", divider);
 
     Ok(())

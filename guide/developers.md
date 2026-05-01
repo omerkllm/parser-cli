@@ -35,8 +35,8 @@ One-line summary of each source file:
 |---|---|
 | `src/main.rs` | Parses command-line arguments via `clap`, routes to `init` / `run` / free-form, drives the tokio runtime, prints errors. |
 | `src/config/mod.rs` | Owns the TOML schema (`[model]`, `[parameters]`, `[paths]`, `[agents]`), the two-layer loader, every validation rule, the `parser init` wizard, and 14 unit tests. |
-| `src/agents/mod.rs` | Defines the `Agent` trait shared by every reasoning role, the `AgentInput` / `AgentOutput` / `AgentError` types, and a placeholder `CoderAgent`. Has 2 unit tests. |
-| `src/providers/mod.rs` | Defines the `ModelProvider` trait that talks to an OpenAI-compatible endpoint, the `Message` and `Role` wire types, and `ProviderError`. Includes `NoopProvider` as a temporary compile stub. |
+| `src/agents/mod.rs` | Defines the `Agent` trait shared by every reasoning role, the `AgentInput` / `AgentOutput` / `AgentError` types, and a real `CoderAgent` that streams through a provider and accumulates the response. Has 2 unit tests. |
+| `src/providers/mod.rs` | Defines the `ModelProvider` trait that talks to an OpenAI-compatible endpoint, the `Message` and `Role` wire types, and `ProviderError`. Provides `OpenAIProvider`, the real HTTP+SSE implementation. Has 4 unit tests using `wiremock`. |
 
 ## The four pipeline phases
 
@@ -148,9 +148,12 @@ pub trait ModelProvider: Send + Sync {
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
-    ) -> Result<Pin<Box<dyn Stream<Item = String> + Send>>, ProviderError> {
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>,
+        ProviderError,
+    > {
         let response = self.complete(messages).await?;
-        Ok(Box::pin(futures::stream::once(async move { response })))
+        Ok(Box::pin(futures::stream::once(async move { Ok(response) })))
     }
 }
 ```
@@ -161,42 +164,68 @@ Two methods, one required:
   response as a `String`. Convenient for tests, batch jobs, or
   any caller that doesn't need streaming.
 - **`stream_completion`** has a default implementation that
-  wraps `complete` in a single-item stream. Real streaming
-  providers (the OpenAI-compatible HTTP impl landing in the
-  next step) override this to parse SSE chunks as they arrive.
+  wraps `complete` in a single-item stream. The real streaming
+  provider (`OpenAIProvider`) overrides it to parse SSE chunks
+  as they arrive.
 
-### Adding a new provider
+The trait yields `Result<String, ProviderError>` items rather
+than bare `String` so mid-stream failures (a malformed SSE
+chunk, a dropped TCP connection) can be reported to the caller
+instead of silently ending the stream.
 
-The pattern looks like this (the real OpenAI-compatible
-provider in the next step will look exactly this way):
+### Caller owns the system message
+
+The provider serializes whatever `Vec<Message>` it receives,
+nothing implicit. Both `main.rs::run_task` and
+`CoderAgent::run` prepend a `Role::System` turn before calling
+the provider.
+
+### `OpenAIProvider` — the real implementation
 
 ```rust
-pub struct OpenAICompatibleProvider {
+pub struct OpenAIProvider {
     endpoint: String,
+    model: String,
     api_key: String,
-    model_name: String,
-    http: reqwest::Client,
-}
-
-#[async_trait]
-impl ModelProvider for OpenAICompatibleProvider {
-    async fn complete(
-        &self,
-        messages: Vec<Message>,
-    ) -> Result<String, ProviderError> {
-        // POST to {endpoint}/chat/completions with the
-        // OpenAI-shaped request body. Map errors to the
-        // right ProviderError variant by HTTP status.
-    }
-
-    // Optionally override stream_completion to parse SSE
-    // for real incremental chunks.
+    max_tokens: u32,
+    temperature: f32,
+    client: reqwest::Client,
 }
 ```
 
-Any endpoint that speaks the OpenAI chat-completions format
-plugs in here — OpenRouter, Ollama, Groq, Together AI, LM
-Studio, etc.
+Built once at startup via `OpenAIProvider::from_config(&cfg)`.
+Works with any endpoint that speaks the OpenAI chat-completions
+wire format: OpenRouter, OpenAI, Groq, Together AI, Ollama, LM
+Studio, etc. See [providers.md](../documentation/providers.md)
+for the full SSE flow, header set, and error mapping.
+
+### The streaming end-to-end flow
+
+The interactive CLI path:
+
+1. `main.rs::run_task` validates the trimmed task and loads
+   `Config`.
+2. Builds `OpenAIProvider::from_config(&cfg)`.
+3. Builds messages: `[Role::System, Role::User]`.
+4. Calls `provider.stream_completion(messages).await?`. A
+   pre-stream failure (auth / network / API status) propagates
+   here; nothing has printed yet.
+5. Prints `User: <task>` + divider + `Response: `.
+6. Loops `while let Some(item) = stream.next().await`:
+   - `Ok(chunk)` → `print!("{}", chunk)`, flush stdout, append
+     to a `collected` buffer.
+   - `Err(e)` → newline, `eprintln!("error: {}", e)`, plus
+     `Stream interrupted. Partial response shown above.` if
+     `collected` is non-empty. Exit 1.
+7. After clean stream end: newline + closing divider. If
+   `collected.is_empty()` → print empty-response message and
+   exit 1.
+
+The agent layer (`CoderAgent::run`) follows the same shape
+internally but *accumulates* chunks into a single `String`
+before returning, and is bypassed by `main.rs` because the
+collect-then-return pattern is incompatible with live
+token-by-token output.
 
 ## How config loading works
 
@@ -262,31 +291,28 @@ Three benefits:
 
 ## Where things stand
 
-**Step 1 is complete.** That covers:
+**Step 1 is complete.** Config system, CLI scaffold, the two
+trait shapes, release profile, CI, input validation.
 
-- The config system, loader, and `parser init` wizard.
-- The CLI scaffold: `init`, `run`, free-form shorthand.
-- The `Agent` trait and `CoderAgent` placeholder.
-- The `ModelProvider` trait and `NoopProvider` stub.
-- Release profile flags (the binary is about 1 MB).
-- GitHub Actions CI: tests on Linux/macOS/Windows, clippy +
-  fmt on Linux, tag-triggered release builds for four
-  platforms.
-- Input validation across config and agent layers.
+**Step 2 is complete.** This step replaced the placeholders
+with real implementations:
 
-**Step 2 is the next major change.** It will:
+- `OpenAIProvider` — real HTTP+SSE against any
+  OpenAI-compatible endpoint. Uses `reqwest` with rustls for
+  the client, hand-rolled SSE line parsing for streaming.
+- `CoderAgent::run` — builds the message list, opens a
+  streaming completion, accumulates chunks, returns the full
+  response. Bypassed by the CLI in favour of direct streaming.
+- `main.rs::run_task` — the streaming CLI path. Tokens print
+  to the terminal as they arrive.
+- `ModelProvider::stream_completion` returns
+  `Stream<Item = Result<String, ProviderError>>` (not bare
+  `String`) so mid-stream errors can reach the caller.
 
-- Replace `NoopProvider` with a real OpenAI-compatible HTTP
-  provider (using `reqwest` for the client and SSE parsing for
-  streaming).
-- Replace `CoderAgent::run`'s placeholder body with a real
-  call: build a system prompt, append the conversation history
-  and the new task, call `provider.complete(messages)`, return
-  the response.
-
-The trait shapes don't change in Step 2 — only the
-implementations behind them. That's the whole point of having
-the traits in place this early.
+The release binary is now about 2.7 MB. The trait shapes are
+unchanged compared to Step 1 *with the single exception of the
+stream item type*; the rest of the surface remained stable
+through the change.
 
 **Step 3** then runs the real Step-2 agent against a fixed task
 set to measure baseline output quality before the four
