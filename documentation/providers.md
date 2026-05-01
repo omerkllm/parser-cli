@@ -28,13 +28,92 @@ Three imports that make the trait possible:
   signature into something dyn-compatible.
 - `futures::Stream` — the trait every async stream implements.
 
-## `Message`
+## `Role`
 
-[src/providers/mod.rs:6](src/providers/mod.rs:6):
+[src/providers/mod.rs:9](src/providers/mod.rs:9):
 
 ```rust
+#[derive(Debug, Clone, Serialize)]
+pub enum Role {
+    #[serde(rename = "system")]
+    System,
+    #[serde(rename = "user")]
+    User,
+    #[serde(rename = "assistant")]
+    Assistant,
+    Other(String),
+}
+```
+
+A typed enum for the `role` field of a `Message`. Using an enum
+instead of a bare `String` means callers can't accidentally pass a
+typo (`"asistant"`, `"User"`) — the compiler enforces correct values
+for the three roles the OpenAI chat-completions schema defines.
+
+| Variant | Wire form | When |
+|---|---|---|
+| `Role::System` | `"system"` | The system / instruction message at the top of a conversation. |
+| `Role::User` | `"user"` | A turn from the human user. |
+| `Role::Assistant` | `"assistant"` | A turn previously emitted by the model. |
+| `Role::Other(String)` | the inner string | Any non-standard role a vendor may introduce — `"tool"`, `"function"`, `"developer"`, etc. The escape hatch keeps the type future-proof without baking every vendor's vocabulary into it. |
+
+The `Display` impl renders each variant as the lowercase wire string
+(`Role::System` → `"system"`, etc., and `Other(s)` → the raw `s`),
+which is what the OpenAI-compatible chat-completions schema expects
+in request bodies.
+
+### Serialization
+
+`Serialize` is derived. The per-variant `#[serde(rename = "...")]`
+attributes mean the three known variants serialize directly to the
+lowercase JSON strings the OpenAI schema requires:
+
+- `Role::System` → JSON string `"system"`
+- `Role::User` → JSON string `"user"`
+- `Role::Assistant` → JSON string `"assistant"`
+
+(`Role::Other("tool")` falls back to the default externally-tagged
+form `{"Other":"tool"}` — fine for an internal decision-log dump,
+but if a future vendor needs a raw-string `Other` on the wire the
+real provider in Step 2 should `Display` the role explicitly when
+building the request body rather than relying on the derive.)
+
+### Deserialization
+
+`Deserialize` is implemented manually rather than derived. The
+incoming string is matched against the three known variants and
+falls through to `Role::Other(s)` for anything else, so a vendor
+sending `"role": "tool"` in a response round-trips cleanly without
+needing the type to know about it ahead of time:
+
+```rust
+impl<'de> Deserialize<'de> for Role {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "system"    => Role::System,
+            "user"      => Role::User,
+            "assistant" => Role::Assistant,
+            _           => Role::Other(s),
+        })
+    }
+}
+```
+
+A derived `Deserialize` would produce externally-tagged JSON for
+`Other` (`{"Other":"..."}`), which doesn't match how role strings
+arrive on the wire. The manual impl keeps deserialization symmetric
+with the renamed-variant serialization for the three known roles
+and graceful for everything else.
+
+## `Message`
+
+[src/providers/mod.rs:30](src/providers/mod.rs:30):
+
+```rust
+#[derive(Serialize, Deserialize)]
 pub struct Message {
-    pub role: String,
+    pub role: Role,
     pub content: String,
 }
 ```
@@ -43,19 +122,14 @@ The canonical role/content pair used everywhere a conversation turn
 is represented:
 
 - **Wire format.** Sent to the provider as part of a chat-completions
-  request body.
+  request body. With `Serialize` derived, the struct goes straight
+  through `serde_json::to_vec` without manual marshalling.
 - **Agent input.** [`AgentInput::conversation_history`](agents.md#agentinput)
   is `Vec<Message>` — the same struct, imported from this module.
-- **Future: decision log.** Step 8's compressor will likely store
-  `Message` records too.
+- **Future: decision log.** Step 7's compressor will likely store
+  `Message` records too; `Deserialize` makes round-tripping free.
 
-`role` is conventionally `"user"`, `"assistant"`, or `"system"` —
-matching the OpenAI chat-completions schema. It's `String`, not an
-enum, deliberately: providers may need to round-trip vendor-specific
-roles (`"tool"`, `"function"`, `"developer"`, etc.) without the type
-having to anticipate them.
-
-`content` is the message text. For Step 3 it's plain text; later
+`content` is the message text. For Step 2 it's plain text; later
 steps may carry tool-call payloads, image references, or structured
 content — at which point the field shape changes here, in one place,
 and consumers track the change.
