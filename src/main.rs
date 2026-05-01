@@ -50,12 +50,12 @@ async fn main() {
 
 /// Execute a coding task end-to-end.
 ///
-/// Today this loads the user's config, prints a confirmation of
-/// the model + endpoint that will be used, instantiates a
-/// [`CoderAgent`] paired with a [`NoopProvider`], and runs the
-/// agent — which currently just returns the placeholder string
-/// `"Coder agent placeholder"`. So today's output is four lines
-/// of confirmation regardless of the task input.
+/// Today this loads the user's config (so validation runs), then
+/// instantiates a [`CoderAgent`] paired with a [`NoopProvider`]
+/// and runs the agent — which currently just returns the
+/// placeholder string `"Coder agent placeholder"`. The output is
+/// the user's task, a divider, the agent's response, and a
+/// closing divider.
 ///
 /// The next step replaces [`NoopProvider`] with the real
 /// OpenAI-compatible provider and replaces `CoderAgent::run`'s
@@ -65,10 +65,7 @@ async fn main() {
 /// already trait-dispatched, so swapping the concrete type is
 /// the only edit needed at the call site.
 async fn run_task(task: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = config::Config::load()?;
-    println!("Config loaded successfully");
-    println!("Model: {}", cfg.model.name);
-    println!("Endpoint: {}", cfg.model.endpoint);
+    config::Config::load()?;
 
     let agent = CoderAgent::new();
     let provider = NoopProvider;
@@ -77,7 +74,12 @@ async fn run_task(task: &str) -> Result<(), Box<dyn std::error::Error>> {
         conversation_history: Vec::new(),
     };
     let output = agent.run(input, &provider).await?;
-    println!("{}", output.response);
+
+    let divider = "─".repeat(29);
+    println!("User: {}", task);
+    println!("{}", divider);
+    println!("Response: {}", output.response);
+    println!("{}", divider);
 
     Ok(())
 }
