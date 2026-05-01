@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::providers::{Message, ModelProvider};
 
 pub struct AgentInput {

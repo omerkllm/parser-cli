@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(clippy::result_large_err)]
+
 use std::env;
 use std::fmt;
 use std::fs;
@@ -360,7 +363,6 @@ fn toml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     fn write_config(dir: &Path, body: &str) -> PathBuf {
         let p = dir.join("parser.config.toml");

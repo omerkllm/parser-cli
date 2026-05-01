@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(clippy::enum_variant_names)]
+
 use std::pin::Pin;
 
 use async_trait::async_trait;
