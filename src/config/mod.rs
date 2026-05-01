@@ -194,10 +194,10 @@ impl Config {
         if !path.exists() {
             return Err(ConfigError::NotFound(path.to_path_buf()));
         }
-        let text = fs::read_to_string(path)
-            .map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
-        let raw: RawConfig = toml::from_str(&text)
-            .map_err(|e| ConfigError::Parse(path.to_path_buf(), e))?;
+        let text =
+            fs::read_to_string(path).map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
+        let raw: RawConfig =
+            toml::from_str(&text).map_err(|e| ConfigError::Parse(path.to_path_buf(), e))?;
         Self::from_raw(raw)
     }
 
@@ -300,18 +300,14 @@ pub fn init() -> Result<(), ConfigError> {
         }
     }
 
-    let endpoint = prompt(
-        "What is your provider endpoint URL?\n  example: https://openrouter.ai/api/v1\n> ",
-    )?;
+    let endpoint =
+        prompt("What is your provider endpoint URL?\n  example: https://openrouter.ai/api/v1\n> ")?;
     validate_endpoint(&endpoint)?;
 
-    let model_name = prompt(
-        "What model do you want to use?\n  example: moonshotai/kimi-k2\n> ",
-    )?;
+    let model_name = prompt("What model do you want to use?\n  example: moonshotai/kimi-k2\n> ")?;
 
-    let api_key_env = prompt(
-        "What environment variable holds your API key?\n  example: OPENROUTER_API_KEY\n> ",
-    )?;
+    let api_key_env =
+        prompt("What environment variable holds your API key?\n  example: OPENROUTER_API_KEY\n> ")?;
 
     fs::create_dir_all(&dir).map_err(|e| ConfigError::Write(dir.clone(), e))?;
     let body = render_minimal_config(&endpoint, &model_name, &api_key_env);
