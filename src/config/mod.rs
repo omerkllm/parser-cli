@@ -185,6 +185,29 @@ fn expand_tilde(input: &str) -> Result<PathBuf, ConfigError> {
 // ---------- loader ----------
 
 impl Config {
+    /// Load and validate `~/.parser/parser.config.toml`.
+    ///
+    /// Two-layer loading strategy:
+    ///
+    /// 1. **Raw deserialize** — TOML is read off disk into
+    ///    [`RawConfig`], a permissive shape where every field is
+    ///    `Option<T>`. This layer's only job is to mirror the
+    ///    on-disk structure; it does no validation.
+    /// 2. **Resolve** — [`Config::from_raw`] converts the raw
+    ///    shape into the strict [`Config`] used by the rest of
+    ///    the program: required fields are checked (returning
+    ///    [`ConfigError::MissingField`]), defaults are applied
+    ///    (`max_tokens = 4096`, `temperature = 0.7`,
+    ///    per-agent model = the global model name), `~`-prefixed
+    ///    paths are expanded to absolute [`PathBuf`]s, the
+    ///    endpoint URL is validated, and the API key is
+    ///    **resolved from its env var** so consumers read
+    ///    `cfg.model.api_key` directly instead of re-checking
+    ///    `std::env::var` every call site.
+    ///
+    /// After this returns `Ok`, every field on `Config` is
+    /// guaranteed present, validated, and ready to use — there is
+    /// no second validation step elsewhere in the codebase.
     pub fn load() -> Result<Self, ConfigError> {
         let path = config_file_path()?;
         Self::load_from(&path)
@@ -367,6 +390,18 @@ mod tests {
         p
     }
 
+    /// Proves that `Config::load_from` resolves the API-key env
+    /// var into `model.api_key` rather than just copying the
+    /// env-var *name* into it. The third assertion (`assert_ne!`)
+    /// is the load-bearing one: if the loader ever regresses to
+    /// copying `api_key_env` into `api_key`, this test fails
+    /// immediately. Matters because every consumer reads
+    /// `model.api_key` directly and never re-checks env vars.
+    ///
+    /// Uses `load_from(&Path)` instead of `load()` so the test
+    /// reads from a temp dir created by `tempfile::tempdir()` —
+    /// `load()` would touch the user's real
+    /// `~/.parser/parser.config.toml`, which tests must never do.
     #[test]
     fn api_key_field_holds_resolved_value_not_env_var_name() {
         let tmp = tempfile::tempdir().unwrap();
@@ -388,6 +423,17 @@ mod tests {
         assert_ne!(cfg.model.api_key, cfg.model.api_key_env);
     }
 
+    /// Proves that a `~/...` path in the config is expanded to an
+    /// absolute [`PathBuf`] before `Config` is returned, with no
+    /// literal `~` left in the resolved value. Matters because
+    /// every later filesystem-touching component (indexer cache,
+    /// decision log, etc.) takes a `&Path` argument and assumes
+    /// it's already resolved — and `~` is not a shell expansion
+    /// on Windows, so an unresolved tilde would silently fail.
+    ///
+    /// Like the other test, uses `load_from(&Path)` against a
+    /// `tempfile::tempdir()` to avoid touching the user's real
+    /// config at `~/.parser/parser.config.toml`.
     #[test]
     fn data_dir_is_fully_resolved_pathbuf_not_tilde_string() {
         let tmp = tempfile::tempdir().unwrap();
