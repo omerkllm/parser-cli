@@ -200,7 +200,15 @@ impl OpenAIProvider {
             api_key: cfg.model.api_key.clone(),
             max_tokens: cfg.parameters.max_tokens,
             temperature: cfg.parameters.temperature,
-            client: reqwest::Client::new(),
+            // 10s connect_timeout: covers DNS + TLS handshake.
+            // 120s timeout: covers the full request including
+            // streaming — long enough for a slow model, short
+            // enough that a hung connection doesn't block forever.
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .expect("failed to build HTTP client"),
         }
     }
 
@@ -235,6 +243,36 @@ impl OpenAIProvider {
     }
 }
 
+/// Typed shape of a single OpenAI-compatible SSE `data:` chunk.
+/// Only the fields we actually read are declared; everything
+/// else (id, created, model, finish_reason, etc.) is ignored.
+///
+/// `delta.content` is `Option<String>` because providers commonly
+/// emit chunks where the field is JSON `null` — typically the
+/// first chunk (which only carries the assistant's role marker)
+/// and the last chunk before `[DONE]` (which carries
+/// `finish_reason` but no new text). With the bare `Value`
+/// traversal we used to do, this worked but obscured intent;
+/// the typed parse makes "content might be null, skip it" the
+/// explicit shape of the data.
+#[derive(Deserialize)]
+struct SseChunk {
+    #[serde(default)]
+    choices: Vec<SseChoice>,
+}
+
+#[derive(Deserialize)]
+struct SseChoice {
+    #[serde(default)]
+    delta: SseDelta,
+}
+
+#[derive(Deserialize, Default)]
+struct SseDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
 /// Map a non-2xx HTTP response to a [`ProviderError`]. Status-code
 /// rules in one place so `complete` and `stream_completion` agree.
 async fn map_error_response(response: reqwest::Response) -> ProviderError {
@@ -260,6 +298,11 @@ async fn map_error_response(response: reqwest::Response) -> ProviderError {
 #[async_trait]
 impl ModelProvider for OpenAIProvider {
     async fn complete(&self, messages: Vec<Message>) -> Result<String, ProviderError> {
+        if self.api_key.is_empty() {
+            return Err(ProviderError::AuthError(
+                "no API key configured — run parser init".to_string(),
+            ));
+        }
         let body = self.build_body(&messages, false);
         let response = self
             .client
@@ -298,6 +341,11 @@ impl ModelProvider for OpenAIProvider {
         messages: Vec<Message>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>, ProviderError>
     {
+        if self.api_key.is_empty() {
+            return Err(ProviderError::AuthError(
+                "no API key configured — run parser init".to_string(),
+            ));
+        }
         let body = self.build_body(&messages, true);
         let response = self
             .client
@@ -367,17 +415,23 @@ impl ModelProvider for OpenAIProvider {
                                 state.3 = true;
                                 continue;
                             }
-                            match serde_json::from_str::<Value>(payload) {
-                                Ok(v) => {
-                                    if let Some(content) = v
-                                        .get("choices")
-                                        .and_then(|c| c.get(0))
-                                        .and_then(|c| c.get("delta"))
-                                        .and_then(|d| d.get("content"))
-                                        .and_then(|c| c.as_str())
+                            // Typed parse: `delta.content` is
+                            // `Option<String>` so a JSON null
+                            // (common on first/last chunks from
+                            // many providers) deserializes to
+                            // `None` instead of panicking. Empty
+                            // strings are also filtered before
+                            // yielding.
+                            match serde_json::from_str::<SseChunk>(payload) {
+                                Ok(parsed) => {
+                                    if let Some(content) = parsed
+                                        .choices
+                                        .into_iter()
+                                        .next()
+                                        .and_then(|c| c.delta.content)
                                     {
                                         if !content.is_empty() {
-                                            state.2.push_back(Ok(content.to_string()));
+                                            state.2.push_back(Ok(content));
                                         }
                                     }
                                 }
